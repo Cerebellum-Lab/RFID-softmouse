@@ -1,0 +1,57 @@
+# Camera reference (enter serial numbers for each)
+cam1:
+  serial: 24122967
+  ismaster: true
+  crop:
+  - 53
+  - 300
+  - 63
+  - 200
+  exposure: 100
+  framerate: 150
+  bin: 4
+  nickname: sideCam
+cam2:
+  serial: 24132859
+  ismaster: false
+  crop:
+  - 53
+  - 300
+  - 63
+  - 200
+  exposure: 100
+  framerate: 150
+  bin: 4
+  nickname: frontCam
+
+# User information
+unitRef: Ben
+raw_data_dir: C:\Users\reynoben\Documents
+interim_data_dir: C:\Users\reynoben\Documents
+compressed_data_dir: C:\Users\reynoben\Documents
+COM: 3
+
+# Stim ROI
+stimAxes: cam3
+stimXWYH:
+- 199
+- 12
+- 140
+- 60
+stimRateX: 6
+
+# Pellet and ROI
+axesRef: cam1
+pelletXY:
+- 259
+- 139
+roiXWYH:
+- 233
+- 12
+- 143
+- 20
+shiftFactor: 10
+
+handThreshold: 15
+pelletThreshold: 50
+stimulusThreshold: 1000

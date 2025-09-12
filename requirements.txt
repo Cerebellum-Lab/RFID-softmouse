@@ -1,0 +1,26 @@
+############################################################
+# Environment creation (Conda example)
+# Create & activate an environment suitable for testing:
+#   conda create -n rfidsoftmouse python=3.10 wxpython numpy matplotlib pillow ruamel.yaml pyserial -c conda-forge
+#   conda activate rfidsoftmouse
+# NOTE: PySpin / Spinnaker SDK must be installed separately from FLIR (not available via pip/conda).
+############################################################
+
+# Core runtime dependencies
+wxPython
+numpy
+matplotlib
+Pillow
+ruamel.yaml
+pyserial
+
+# (Built-in stdlib modules used: sqlite3, http.server, multiprocessing, pathlib, csv, json, shutil, ctypes, queue, datetime, winsound)
+
+# Optional / hardware-specific (install manually as needed):
+# PySpin            # Provided by FLIR Spinnaker SDK installer
+# pyspin            # Alternative PyPI wrapper name some environments use
+
+# Future optional utilities (uncomment if you add code requiring them):
+requests
+fastapi
+uvicorn

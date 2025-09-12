@@ -554,21 +554,21 @@ class MainFrame(wx.Frame):
         self.setDelStyle()
 
     def lookupRFID(self, event):
-        """Lookup RFID in local mirror (db.py) and cache for metadata inclusion."""
+        """Lookup RFID via FastAPI service (requests) with DB fallback."""
         tag = self.rfid_input.GetValue().strip()
         if not tag:
             self.statusbar.SetStatusText("No RFID entered")
             return
         try:
-            import db  # local helper
-            conn = db.connect()
-            rec = db.get_mouse(conn, tag)
+            import rfid_lookup
+            rec = rfid_lookup.fetch_mouse(tag)
             if rec:
                 self.mouse_meta = rec
-                self.statusbar.SetStatusText(f"RFID {tag} loaded: {rec.get('mouse_id','?')}")
+                src = 'HTTP' if 'source' in rec else 'local'
+                self.statusbar.SetStatusText(f"RFID {tag} loaded ({src})")
             else:
                 self.mouse_meta = dict()
-                self.statusbar.SetStatusText(f"RFID {tag} not found in local DB")
+                self.statusbar.SetStatusText(f"RFID {tag} not found")
         except Exception as e:
             self.statusbar.SetStatusText(f"RFID error: {e}")
         

@@ -25,6 +25,7 @@ import shutil
 from pathlib import Path
 import ruamel.yaml
 import winsound
+from app_logging import get_logger
 
 # ###########################################################################
 # Class for GUI MainFrame
@@ -114,6 +115,8 @@ class MainFrame(wx.Frame):
                             size = wx.Size(self.gui_size), pos = wx.DefaultPosition, style = wx.RESIZE_BORDER|wx.DEFAULT_FRAME_STYLE|wx.TAB_TRAVERSAL )
         self.statusbar = self.CreateStatusBar()
         self.statusbar.SetStatusText("")
+        self.log = get_logger('gui')
+        self.log.info('GUI MainFrame initialized')
 
         self.SetSizeHints(wx.Size(self.gui_size)) #  This sets the minimum size of the GUI. It can scale now!
         
@@ -569,19 +572,56 @@ class MainFrame(wx.Frame):
         tag = self.rfid_input.GetValue().strip()
         if not tag:
             self.statusbar.SetStatusText("No RFID entered")
+            self.log.warning('Lookup attempt with empty RFID input')
             return
         try:
             import rfid_lookup
             rec = rfid_lookup.fetch_mouse(tag)
             if rec:
+                previous_rfid = self.mouse_meta.get('rfid') if getattr(self, 'mouse_meta', None) else None
                 self.mouse_meta = rec
+                # Ensure active_rfid tracks current
+                self.active_rfid = rec.get('rfid') or tag
+                if previous_rfid and previous_rfid != self.active_rfid:
+                    self.log.info('RFID replaced old=%s new=%s', previous_rfid, self.active_rfid)
                 src = 'HTTP' if 'source' in rec else 'local'
                 self.statusbar.SetStatusText(f"RFID {tag} loaded ({src})")
+                self.log.info('RFID %s loaded source=%s', tag, src)
             else:
                 self.mouse_meta = dict()
                 self.statusbar.SetStatusText(f"RFID {tag} not found")
+                self.log.info('RFID %s not found', tag)
         except Exception as e:
             self.statusbar.SetStatusText(f"RFID error: {e}")
+            self.log.exception('RFID lookup error for %s: %s', tag, e)
+
+    def write_metalink_entry(self):
+        """Append a metalink entry linking RFID/mouse metadata to this session.
+
+        Creates temp/metalink.txt with one JSON object per line:
+        {"rfid":..., "session_dir":..., "session_name":..., "raw_meta":..., "timestamp":..., "mouse":{...}}
+        """
+        import json, pathlib, datetime as _dt
+        if not getattr(self, 'mouse_meta', None):
+            return
+        rfid = self.mouse_meta.get('rfid') or self.active_rfid
+        if not rfid:
+            return
+        sess_name = os.path.basename(self.sess_dir)
+        entry = {
+            "rfid": rfid,
+            "session_dir": self.sess_dir,
+            "session_name": sess_name,
+            "raw_meta": self.metapath,
+            "timestamp": _dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            "mouse": self.mouse_meta,
+        }
+        tmp_dir = pathlib.Path(__file__).parent / 'temp'
+        tmp_dir.mkdir(exist_ok=True)
+        metalink_path = tmp_dir / 'metalink.txt'
+        with metalink_path.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(entry) + '\n')
+        self.log.info('Metalink appended rfid=%s session=%s', rfid, sess_name)
         
     def setProtocol(self, event):
         self.proto_str = self.protocol.GetStringSelection()
@@ -1276,6 +1316,16 @@ class MainFrame(wx.Frame):
                 self.recTimer.Start(liveRate)
             self.rec.SetLabel('Stop')
             self.play.SetLabel('Abort')
+            if getattr(self, 'mouse_meta', None):
+                self.log.info('Recording started session_dir=%s rfid=%s', self.sess_dir, self.mouse_meta.get('rfid'))
+            else:
+                self.log.info('Recording started session_dir=%s no RFID metadata', self.sess_dir)
+            # Write metalink entry if RFID metadata present
+            try:
+                if getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
+                    self.write_metalink_entry()
+            except Exception as e:
+                self.log.exception('Failed to write metalink entry: %s', e)
         else:
             self.compress_vid.Enable(True)
             self.com.value = 11
@@ -1295,6 +1345,7 @@ class MainFrame(wx.Frame):
                 except Exception as e:
                     print(f'Failed to attach mouse metadata: {e}')
             clara.write_metadata(self.meta, self.metapath)
+            self.log.info('Recording stopped session_dir=%s metadata_written=%s', self.sess_dir, self.metapath)
             if self.recTimer.IsRunning():
                 self.recTimer.Stop()
             self.stopAq()

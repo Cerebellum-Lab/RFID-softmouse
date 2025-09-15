@@ -13,13 +13,17 @@ from pathlib import PurePath
 import cv2
 import multiCam_DLC_utils_v2 as clara
 import shutil
+from app_logging import get_logger
+import json, pathlib, datetime as _dt
 
 class CLARA_compress(Process):
     def __init__(self):
         super().__init__()
+        self.log = get_logger('compress')
         
     def run(self):
         try:
+            self.log.info('Starting compression process')
             dirlist = list()
             destlist = list()
             user_cfg = clara.read_config()
@@ -42,6 +46,7 @@ class CLARA_compress(Process):
                 if not os.path.exists(destlist[ndx]):
                     os.makedirs(destlist[ndx])
                 if len(vid_list):
+                    self.log.info('Compressing %d videos in %s', len(vid_list), s)
                     proc = list()
                     for v in vid_list:
                         vid_name = PurePath(v)
@@ -63,9 +68,9 @@ class CLARA_compress(Process):
                         passvals.append(passval)
                         if passval:
                             os.remove(v)
-                            print('Successfully compressed %s' % vid_name.stem)
+                            self.log.info('Successfully compressed %s', vid_name.stem)
                         else:
-                            print('Error compressing %s' % vid_name.stem)
+                            self.log.error('Error compressing %s', vid_name.stem)
                 metafiles = glob.glob(os.path.join(s,'*'))
                 for m in metafiles:
                     mname = PurePath(m).name
@@ -73,9 +78,14 @@ class CLARA_compress(Process):
                     if not os.path.isfile(mdest):
                         if not '.avi' in m:
                             shutil.copyfile(m,mdest)
-            print('\n\n---- Compression is complete!!! ----\n\n')
+            # After video compression, process metalink entries
+            try:
+                self._process_metalink(user_cfg)
+            except Exception:
+                self.log.exception('Failed processing metalink entries')
+            self.log.info('Compression is complete')
         except Exception as ex:
-            print(ex)
+            self.log.exception('Compression process failed: %s', ex)
             
     def testVids(self, v, dest_path):
         try:
@@ -91,3 +101,72 @@ class CLARA_compress(Process):
             passval = False
             
         return passval
+
+    def _process_metalink(self, user_cfg):
+        """Read temp/metalink.txt and materialize metadata into destination session folders.
+
+        For each line JSON object with keys rfid, session_dir, session_name, raw_meta, mouse.
+        We derive compressed session path from interim directory structure and create
+        a metadata file: <date>_<unitRef>_<session>_rfid_<rfid>_mousemeta.json
+        """
+        tmp_dir = pathlib.Path(__file__).parent / 'temp'
+        metalink_path = tmp_dir / 'metalink.txt'
+        if not metalink_path.exists():
+            self.log.info('No metalink file found, skipping metadata link step')
+            return
+        lines = metalink_path.read_text(encoding='utf-8').strip().splitlines()
+        if not lines:
+            self.log.info('Metalink file empty')
+            return
+        remaining = []
+        processed = 0
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+                session_dir = obj.get('session_dir')
+                rfid = obj.get('rfid')
+                if not (session_dir and rfid):
+                    self.log.warning('Skipping malformed metalink entry: %s', ln)
+                    continue
+                # Build compressed destination path: replace interim_data_dir raw root with compressed root
+                # session_dir layout: raw_data_dir/YYYYMMDD/unitRef/sessionXYZ
+                # compressed path we produced: compressed_data_dir/YYYYMMDD/unitRef/sessionXYZ
+                # Retrieve date/unitRef from session_dir
+                try:
+                    parts = pathlib.Path(session_dir).parts
+                    # find last 4 path parts containing date, unitRef, session name
+                    session_name = obj.get('session_name') or parts[-1]
+                    unitRef = user_cfg['unitRef']
+                    # search for date pattern YYYYMMDD in parts
+                    date_part = None
+                    for p in parts:
+                        if len(p) == 8 and p.isdigit():
+                            date_part = p
+                    if not date_part:
+                        raise ValueError('date segment not found in session_dir')
+                    compressed_session = pathlib.Path(user_cfg['compressed_data_dir']) / date_part / unitRef / session_name
+                    compressed_session.mkdir(parents=True, exist_ok=True)
+                    meta_filename = f"{date_part}_{unitRef}_{session_name}_rfid_{rfid}_mousemeta.json"
+                    meta_dest = compressed_session / meta_filename
+                    payload = {
+                        'rfid': rfid,
+                        'session_name': session_name,
+                        'timestamp_linked': _dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                        'mouse': obj.get('mouse'),
+                        'raw_meta_source': obj.get('raw_meta')
+                    }
+                    meta_dest.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+                    self.log.info('Metalink metadata written %s', meta_dest)
+                    processed += 1
+                except Exception as e:
+                    self.log.warning('Failed to process metalink entry for session_dir=%s: %s', session_dir, e)
+                    remaining.append(ln)
+            except json.JSONDecodeError:
+                self.log.warning('Invalid JSON in metalink: %s', ln)
+        # Rewrite remaining entries (those not processed) to metalink
+        if remaining:
+            metalink_path.write_text('\n'.join(remaining) + '\n', encoding='utf-8')
+            self.log.info('Metalink processed=%d remaining=%d', processed, len(remaining))
+        else:
+            metalink_path.unlink(missing_ok=True)
+            self.log.info('All metalink entries processed=%d file removed', processed)

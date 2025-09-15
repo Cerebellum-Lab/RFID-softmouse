@@ -6,6 +6,7 @@ Created on Tue Jul 23 10:26:20 2019
 @author: bioelectrics
 """
 import sys, linecache
+from app_logging import get_logger
 from multiprocessing import Process
 from queue import Empty
 import multiCam_DLC_utils_v2 as clara
@@ -25,6 +26,7 @@ class arduinoCtrl(Process):
         self.stim_selection = stim_selection
         self.del_style = del_style
         self.pellet_arrived = 0
+        self.log = get_logger('arduino')
         
     def run(self):
         serSuccess = False
@@ -33,6 +35,7 @@ class arduinoCtrl(Process):
             self.ser = serial.Serial('COM'+str(user_cfg['COM']), write_timeout=0.001)
             serSuccess = True
             self.com.value = 0
+            self.log.info('Arduino serial connected on COM%s', user_cfg['COM'])
         except:
             exc_type, exc_obj, tb = sys.exc_info()
             f = tb.tb_frame
@@ -40,14 +43,14 @@ class arduinoCtrl(Process):
             filename = f.f_code.co_filename
             linecache.checkcache(filename)
             line = linecache.getline(filename, lineno, f.f_globals)
-            print(f'EXCEPTION IN ({filename}, LINE {lineno} "{line.strip()}"): {exc_obj}')
-            print('\n---Failed to connect to Arduino---\n')
+            self.log.exception('Failed to connect to Arduino (%s line %s): %s', filename, lineno, exc_obj)
+            self.log.error('Failed to connect to Arduino')
             self.com.value = -1
             self.ardq_p2read.put('done')
             
         time.sleep(2)
         if serSuccess == True:
-            print('---Arduino ready---\n')
+            self.log.info('Arduino ready')
             
         self.ardq_p2read.put('done')
         self.record = False 
@@ -79,7 +82,7 @@ class arduinoCtrl(Process):
                             event = line + '_played'
                             self.events.write("%s\t%s\n\r" % (event,self.frm.value))
                     if len(line) and 'HomeFail' in line:
-                        print('Home Position Fail!')
+                        self.log.warning('Home Position Fail!')
                         self.is_busy.value = -1
                         time.sleep(5)
                         
@@ -104,7 +107,7 @@ class arduinoCtrl(Process):
                     filename = f.f_code.co_filename
                     linecache.checkcache(filename)
                     line = linecache.getline(filename, lineno, f.f_globals)
-                    print('EXCEPTION IN ({}, LINE {} "{}"): {}'.format(filename, lineno, line.strip(), exc_obj))
+                    self.log.exception('Exception handling Arduino queue message (%s line %s)', filename, lineno)
                     
                     self.ardq_p2read.put('done')
             
@@ -130,15 +133,14 @@ class arduinoCtrl(Process):
                 elif comVal == 4:
                     msg = 'R0x'
                     event = 'pellet_delivery'
-                    print(round((self.frm.value-self.pellet_arrived)/0.150))
-                    print(f'pellet delivered {self.frm.value}')
+                    self.log.info('Pellet delivered frame=%s deltaFrames=%s', self.frm.value, round((self.frm.value-self.pellet_arrived)/0.150))
                 elif comVal == 5:
                     msg = 'W' + str(self.stim_selection.value) + 'x'
                 elif comVal == 6:
                     msg = 'Fx'
                     event = 'pellet_detected'
                     self.pellet_arrived = self.frm.value
-                    print(f'pellet_arrived{self.pellet_arrived}')
+                    self.log.info('Pellet detected frame=%s', self.pellet_arrived)
                 elif comVal == 7: # block ButtonStyleChange
                     msg = 'D0x'
                 elif comVal == 8: # allowButtonStyleChange
@@ -166,10 +168,10 @@ class arduinoCtrl(Process):
                     msg = 'L'+str(self.del_style.value)+'x'
                     if self.del_style.value == 0:
                         event = 'style_setA'
-                        print("crtl styleA")
+                        self.log.info('Control style A set')
                     else:
                         event = 'style_setB'
-                        print("crtl styleB")
+                        self.log.info('Control style B set')
                 elif comVal == 16:
                     msg = 'Sx'
                 self.ser.write(msg.encode())
@@ -187,8 +189,8 @@ class arduinoCtrl(Process):
                             if self.record and len(event):
                                 self.events.write("%s\t%s\n\r" % (event,self.frm.value))
                             if len(event):
-                                print(f'recorded value for {event}: {self.frm.value}')
-                            print('%s in %d attempt(s)' % (line,attmpt))
+                                self.log.debug('Recorded event %s frame=%s', event, self.frm.value)
+                            self.log.debug('%s in %d attempt(s)', line, attmpt)
                             self.is_busy.value = 1;
                             self.com.value = 0
                             return
@@ -205,7 +207,7 @@ class arduinoCtrl(Process):
                 
             
             if (time.time() > (stA + 2)):
-                print('Arduino send fail - %d - %s in %d tries' % (comVal,msg,attmpt))
+                self.log.error('Arduino send fail comVal=%d msg=%s attempts=%d', comVal, msg, attmpt)
                 self.com.value = 0
                 return
 

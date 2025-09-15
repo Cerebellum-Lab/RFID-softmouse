@@ -11,8 +11,12 @@ from fastapi import FastAPI, HTTPException, Depends
 from auth_placeholder import token_dependency
 from pydantic import BaseModel
 import db, etl_softmouse, pathlib
+from app_logging import get_logger
+
+log = get_logger('fastapi_service')
 
 app = FastAPI(title="RFID SoftMouse Mirror API", version="0.1.0")
+log.info('Starting fastapi_service')
 
 db.init()
 _conn = db.connect()
@@ -39,15 +43,24 @@ async def health():
 
 @app.get('/mouse/{rfid}', response_model=Mouse)
 async def get_mouse(rfid: str, _ok = Depends(token_dependency)):
+    log.debug(f'Lookup RFID {rfid}')
     rec = db.get_mouse(_conn, rfid)
     if not rec:
+        log.warning(f'RFID {rfid} not found')
         raise HTTPException(status_code=404, detail="not_found")
+    log.info(f'RFID {rfid} served')
     return rec  # FastAPI + Pydantic will filter/validate
 
 @app.post('/reload')
 async def reload_data(req: ReloadRequest, _ok = Depends(token_dependency)):
     exports_dir = pathlib.Path(req.exports) if req.exports else pathlib.Path('exports')
-    etl_softmouse.etl(exports_dir)
+    log.info(f'Reload requested for exports dir {exports_dir}')
+    try:
+        etl_softmouse.etl(exports_dir)
+        log.info('Reload complete')
+    except Exception as e:
+        log.exception('Reload failed')
+        raise HTTPException(status_code=500, detail=str(e))
     return {"reloaded": True, "exports": str(exports_dir)}
 
 # Convenience root

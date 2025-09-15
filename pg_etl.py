@@ -13,6 +13,9 @@ Usage:
 from __future__ import annotations
 import argparse, csv, json, os, pathlib, sys, psycopg2
 from typing import Dict, List, Any
+from app_logging import get_logger
+
+log = get_logger('pg_etl')
 
 REQUIRED = {
     'mice': ['RFID','MouseID','Sex','DOB','Strain','Status','Cage'],
@@ -85,7 +88,9 @@ def refresh_view(conn):
 
 
 def run(exports: pathlib.Path):
+    log.info(f'Start ETL exports_dir={exports}')
     if not exports.exists():
+        log.error(f'Exports directory not found: {exports}')
         raise SystemExit(f"Exports directory not found: {exports}")
     data = {}
     # Load each file if present
@@ -96,6 +101,9 @@ def run(exports: pathlib.Path):
             if rows:
                 validate_columns(key, list(rows[0].keys()))
             data[key] = rows
+            log.info(f'Loaded {len(rows)} rows for {key}')
+        else:
+            log.debug(f'File missing (skipped) {path}')
     # Re-shape mice + attach genotypes
     genotypes_by_rfid = {}
     for g in data.get('genotypes', []):
@@ -158,8 +166,9 @@ def run(exports: pathlib.Path):
             'notes': lt.get('Notes')
         })
 
+    log.info(f'Prepared rows mice={len(mice_rows)} cages={len(cage_rows)} matings={len(mating_rows)} litters={len(litter_rows)}')
     dsn_str = dsn()
-    print('Connecting to', dsn_str)
+    log.info(f'Connecting to {dsn_str}')
     conn = psycopg2.connect(dsn_str)
     try:
         upsert_mice(conn, mice_rows)
@@ -167,10 +176,17 @@ def run(exports: pathlib.Path):
         upsert_simple('matings','mating_id', mating_rows, conn)
         upsert_simple('litters','litter_id', litter_rows, conn)
         conn.commit()
+        log.info('Committed upserts')
         refresh_view(conn)
+        log.info('Refresh view complete')
         print('ETL complete.')
+    except Exception:
+        log.exception('ETL failed')
+        conn.rollback()
+        raise
     finally:
         conn.close()
+        log.info('Connection closed')
 
 
 def main(argv=None):

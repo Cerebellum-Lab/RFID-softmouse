@@ -14,12 +14,15 @@ Run:
 """
 from __future__ import annotations
 import os, psycopg2, json
+from app_logging import get_logger
 from fastapi import FastAPI, HTTPException, Depends, Query
 from auth_placeholder import token_dependency
 from writeback_queue import load_all
 from pydantic import BaseModel
 
+log = get_logger('pg_api')
 app = FastAPI(title='SoftMouse Postgres Mirror API', version='0.2.0')
+log.info('Starting pg_api service')
 
 _conn = None
 
@@ -62,17 +65,21 @@ async def health():
         with conn.cursor() as cur:
             cur.execute('SELECT 1')
             cur.fetchone()
+        log.debug('Health check OK')
         return {'status':'ok'}
     except Exception as e:
+        log.exception('Health check failed')
         return {'status':'error','detail': str(e)}
 
 @app.get('/mouse/{rfid}', response_model=Mouse)
 async def get_mouse(rfid: str, _ok = Depends(token_dependency)):
+    log.debug(f'Lookup RFID {rfid}')
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute('SELECT * FROM mouse_full WHERE rfid=%s', (rfid,))
         row = cur.fetchone()
         if not row:
+            log.warning(f'RFID {rfid} not found')
             raise HTTPException(status_code=404, detail='not_found')
         cols = [d[0] for d in cur.description]
         rec = dict(zip(cols, row))
@@ -83,7 +90,8 @@ async def get_mouse(rfid: str, _ok = Depends(token_dependency)):
                 rec['genotype_json'] = json.loads(gj)
             except Exception:
                 pass
-        return rec
+    log.info(f'RFID {rfid} served')
+    return rec
 
 @app.get('/')
 async def root(_ok = Depends(token_dependency)):
@@ -92,14 +100,17 @@ async def root(_ok = Depends(token_dependency)):
 @app.post('/refresh')
 async def refresh(_ok = Depends(token_dependency)):
     # Refresh materialized view
+    log.info('Manual refresh requested')
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute('REFRESH MATERIALIZED VIEW CONCURRENTLY mouse_full')
     conn.commit()
+    log.info('Refresh complete')
     return {'refreshed': True}
 
 @app.get('/queue')
 async def queue(status: str | None = Query(default=None), _ok = Depends(token_dependency)):
+    log.debug(f'Queue list requested status={status}')
     recs = load_all()
     if status:
         recs = [r for r in recs if r.get('status') == status]
@@ -107,7 +118,9 @@ async def queue(status: str | None = Query(default=None), _ok = Depends(token_de
 
 @app.get('/queue/{rfid}')
 async def queue_rfid(rfid: str, _ok = Depends(token_dependency)):
+    log.debug(f'Queue list for RFID {rfid}')
     recs = [r for r in load_all() if r.get('rfid') == rfid]
     if not recs:
+        log.warning(f'No patches found for {rfid}')
         raise HTTPException(status_code=404, detail='no_patches')
     return {'count': len(recs), 'items': recs}

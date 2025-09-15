@@ -1,0 +1,9 @@
+waitMin: 0
+waitMax: 0
+waitCt: 1
+protocolSelected: 0
+deliveryStyle: 0
+waitAfterHand: 1.0
+maxWait4Hand: 10.0
+minTime2Eat: 2.0
+maxTime2Eat: 30.0

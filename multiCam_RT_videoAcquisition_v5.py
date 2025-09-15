@@ -543,11 +543,22 @@ class MainFrame(wx.Frame):
             with open(path, 'r') as f:
                 self.user_cfg = ruamelFile.load(f)
         else:
-            self.user_cfg = 'none'
+            # Create default user config when file doesn't exist
+            self.user_cfg = {
+                'waitMin': 0,
+                'waitMax': 0,
+                'waitCt': 1,
+                'protocolSelected': 0,
+                'deliveryStyle': 0,
+                'waitAfterHand': 1.0,
+                'maxWait4Hand': 10.0,
+                'minTime2Eat': 2.0,
+                'maxTime2Eat': 30.0
+            }
             
-        self.tone_delay_min.SetValue(str(self.user_cfg['waitMin']))
-        self.tone_delay_max.SetValue(str(self.user_cfg['waitMax']))
-        self.delay_count.SetValue(str(self.user_cfg['waitCt']))
+        self.tone_delay_min.SetValue(int(self.user_cfg['waitMin']))
+        self.tone_delay_max.SetValue(int(self.user_cfg['waitMax']))
+        self.delay_count.SetValue(int(self.user_cfg['waitCt']))
         self.make_delay_iters()
         self.protocol.SetSelection(self.user_cfg['protocolSelected'])
         self.setProtocol(None)

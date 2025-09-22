@@ -34,3 +34,4 @@ uvicorn
 # For exported spreadsheet parsing to DataFrame
 pandas
 openpyxl
+keyring  # secure credential storage (optional, used if available)

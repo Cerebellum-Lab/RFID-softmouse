@@ -16,8 +16,9 @@ Notes:
 
 """
 from __future__ import annotations
-import asyncio, argparse, os, sys, re, tempfile, shutil, time, pathlib, getpass
-from typing import Optional
+import asyncio, argparse, os, sys, re, tempfile, shutil, time, pathlib, getpass, datetime, mimetypes, json, struct
+import hashlib
+from typing import Optional, Tuple
 from app_logging import get_logger
 
 log = get_logger('softmouse.export')
@@ -36,6 +37,8 @@ COLONY_LINK_STRICT_SELECTOR = "a"  # We'll filter by inner_text regex
 ANIMALS_NAV_SELECTOR = "li#mice a[href*='smdb/mouse/list.do']"
 GO_TO_ANIMALS_SELECTOR = "#gotoBtn"
 EXPORT_BUTTON_SELECTOR = "#exportMouseMenuButton"
+EXPORTS_TAB_SELECTOR = "a:has-text('Exports'), a[href*='export/history' i]"
+EXPORTS_TABLE_ROWS = "table tr"
 POST_LOGIN_JS_CHECK = 'typeof ISH !== "undefined" && ISH.appContext && ISH.appContext.accessUserId > 0'
 
 # Reuse refined selectors from login script (subset)
@@ -52,6 +55,54 @@ ERROR_INDICATORS = [
 
 class ExportError(Exception):
     pass
+
+# ---------------- Credential Layering Utilities -----------------
+
+def _try_keyring() -> Tuple[Optional[str], Optional[str]]:
+    try:
+        import keyring  # type: ignore
+        u = keyring.get_password('softmouse', 'username')
+        if u:
+            p = keyring.get_password('softmouse', u)
+            return u, p
+    except Exception:
+        return None, None
+    return None, None
+
+def _store_keyring(user: str, pwd: str):
+    try:
+        import keyring  # type: ignore
+        keyring.set_password('softmouse', 'username', user)
+        keyring.set_password('softmouse', user, pwd)
+        log.info('Stored credentials in system keyring (service=softmouse).')
+    except Exception as e:  # pragma: no cover
+        log.warning('Failed storing credentials in keyring: %s', e)
+
+def get_credentials(args) -> Tuple[str, str]:
+    """Layered credential retrieval: env -> keyring -> prompt.
+    Returns (user, pwd) or exits if unavailable.
+    """
+    sources: list[str] = []
+    user = (os.getenv('SOFTMOUSE_USER') or '').strip()
+    pwd = (os.getenv('SOFTMOUSE_PASSWORD') or '').strip()
+    if user and pwd:
+        sources.append('env')
+    elif not args.no_keyring:
+        ku, kp = _try_keyring()
+        if ku and kp:
+            user, pwd = ku, kp
+            sources.append('keyring')
+    if args.prompt and (not user or not pwd):
+        user = input('SoftMouse username: ').strip() or user
+        pwd = getpass.getpass('SoftMouse password: ') or pwd
+        sources.append('prompt')
+    if not user or not pwd:
+        raise SystemExit('Not authenticated and no credentials supplied. Set env vars, keyring, or use --prompt.')
+    if args.store_credentials and 'keyring' not in sources and not args.no_keyring:
+        _store_keyring(user, pwd)
+    fp = hashlib.sha256(user.encode('utf-8')).hexdigest()[:8]
+    log.info('Credential sources: %s (user fp %s)', '+'.join(sources) or 'unknown', fp)
+    return user, pwd
 
 async def _wait_for_auth(page: Page, timeout: float = 20.0):
     start = time.time()
@@ -110,38 +161,203 @@ async def _goto_animals(page: Page, timeout: float = 25.0):
         if not await _selector_exists(page, EXPORT_BUTTON_SELECTOR):
             raise ExportError('Failed to reach Animals page (export button not found).')
 
-async def _trigger_export(page: Page, download_dir: str, timeout: float = 30.0, debug: bool = False) -> pathlib.Path:
-    # Ensure download directory exists & empty
-    os.makedirs(download_dir, exist_ok=True)
-    for f in pathlib.Path(download_dir).glob('*'):
+async def _fetch_taskid(page: Page, url: str, download_dir: str) -> pathlib.Path | None:
+    """Directly fetch downLoadFile?taskid= URL using context.request to bypass UI download issues."""
+    log.info('Attempting direct taskid fetch: %s', url)
+    ctx = page.context
+    resp = await ctx.request.get(url)
+    if not resp.ok:
+        log.warning('Taskid fetch status %s', resp.status)
+        return None
+    body = await resp.body()
+    # Try to derive filename from content-disposition header
+    cd = resp.headers.get('content-disposition','') if hasattr(resp,'headers') else ''
+    fname = None
+    m = re.search(r'filename="?([^";]+)"?', cd)
+    if m:
+        fname = m.group(1)
+    if not fname:
+        # fabricate
+        ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+        # Heuristic: If body is ZIP (xlsx) choose xlsx
+        if body.startswith(b'PK'):
+            fname = f'animal_export_{ts}.xlsx'
+        elif body.startswith(b'\xD0\xCF\x11\xE0'):
+            fname = f'animal_export_{ts}.xls'
+        else:
+            fname = f'animal_export_{ts}.csv'
+    path = pathlib.Path(download_dir)/fname
+    with open(path,'wb') as fh:
+        fh.write(body)
+    log.info('Saved taskid fetch to %s (%d bytes)', path, len(body))
+    return _maybe_fix_extension(path)
+
+def _dump_debug_export(page: Page):  # fire-and-forget helper
+    async def _inner():
         try:
-            f.unlink()
+            html = await page.content()
+            with open('export_debug.html','w',encoding='utf-8') as fh:
+                fh.write(html)
+            log.info('Saved export_debug.html')
         except Exception:
             pass
-    log.info('Clicking export button %s', EXPORT_BUTTON_SELECTOR)
-    try:
-        async with page.expect_download() as dl_info:
-            await page.click(EXPORT_BUTTON_SELECTOR)
-        download = await dl_info.value
-    except AttributeError:
-        # Older playwright or mismatch; fallback to event listener
-        await page.click(EXPORT_BUTTON_SELECTOR)
+    asyncio.create_task(_inner())
+
+class _NetworkSniffer:
+    """Lightweight network sniffer to grab CSV/XLS/XLSX responses if no download event fires.
+    When trace=True, records metadata for every response into network_log.json.
+    """
+    INTERESTING_CT = {'text/csv','application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+    def __init__(self, trace: bool=False, log_dir: str|None=None):
+        self._responses = []
+        self._attached = False
+        self._trace = trace
+        self._log_dir = pathlib.Path(log_dir) if log_dir else pathlib.Path('.')
+        if trace:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._meta: list[dict] = []
+
+    def attach(self, page: Page):
+        if self._attached:
+            return
+        page.on('response', self._on_response)
+        self._attached = True
+        self._page = page
+
+    def detach(self):
+        if not self._attached:
+            return
         try:
-            download = await page.wait_for_event('download', timeout=timeout*1000)
-        except Exception as e:
-            if debug:
-                try:
-                    html = await page.content()
-                    with open('export_debug.html','w',encoding='utf-8') as fh:
-                        fh.write(html)
-                    log.info('Saved export_debug.html')
-                except Exception:
-                    pass
-            raise ExportError(f'No download event captured: {e}')
-    save_path = pathlib.Path(download_dir) / download.suggested_filename
-    await download.save_as(str(save_path))
-    log.info('Downloaded file: %s', save_path)
-    return save_path
+            self._page.off('response', self._on_response)
+        except Exception:
+            pass
+        self._attached = False
+
+    def _on_response(self, resp):  # sync callback
+        try:
+            ct = (resp.headers or {}).get('content-type','').split(';')[0].strip().lower()
+            url = resp.url
+            if any(ext in url for ext in ('.csv','.xls','.xlsx')) or ct in self.INTERESTING_CT:
+                self._responses.append(resp)
+            if self._trace:
+                self._meta.append({
+                    'url': url,
+                    'status': resp.status,
+                    'content_type': ct,
+                    'headers': resp.headers,
+                    'timestamp': time.time()
+                })
+        except Exception:
+            pass
+
+    async def try_save(self, download_dir: str) -> pathlib.Path | None:
+        for resp in self._responses[::-1]:  # newest first
+            try:
+                body = await resp.body()
+                # Determine filename
+                url_path = resp.url.split('?')[0]
+                name = os.path.basename(url_path) or 'export'
+                if not re.search(r'\.csv|\.xlsx?|$', name, re.I):
+                    # guess from content-type
+                    ct = (resp.headers or {}).get('content-type','').lower()
+                    if 'csv' in ct:
+                        name += '.csv'
+                    elif 'openxml' in ct:
+                        name += '.xlsx'
+                    elif 'excel' in ct:
+                        name += '.xls'
+                    else:
+                        name += '.dat'
+                path = pathlib.Path(download_dir)/name
+                with open(path,'wb') as fh:
+                    fh.write(body)
+                return _maybe_fix_extension(path)
+            except Exception:
+                continue
+        return None
+    def write_log(self):
+        if self._trace and self._meta:
+            try:
+                out = self._log_dir / 'network_log.json'
+                with open(out,'w',encoding='utf-8') as fh:
+                    json.dump(self._meta, fh, indent=2)
+                log.info('Wrote network log %s (%d entries)', out, len(self._meta))
+            except Exception as e:
+                log.warning('Failed writing network log: %s', e)
+
+async def _attempt_inline_capture(page: Page, download_dir: str, debug: bool=False) -> pathlib.Path | None:
+    """If export rendered content inline (e.g., CSV in same tab), attempt to extract.
+    Strategy:
+      1. Check for <pre>, <body> text that looks like CSV (contains commas and line breaks).
+      2. If found, write to timestamped file.
+    Returns path or None.
+    """
+    try:
+        content = await page.content()
+        # Quick heuristic: look for first 5000 chars of visible text
+        text = await page.evaluate("document.body.innerText.slice(0,50000)")
+        if text and (',' in text) and ('\n' in text) and len(text.splitlines()) > 3:
+            # Assume CSV
+            ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+            fname = f'animals_inline_{ts}.csv'
+            path = pathlib.Path(download_dir)/fname
+            # Trim trailing excessive whitespace
+            with open(path,'w',encoding='utf-8') as fh:
+                fh.write(text.strip())
+            log.info('Captured inline CSV to %s', path)
+            return path
+    except Exception as e:
+        if debug:
+            log.warning('Inline capture attempt failed: %s', e)
+    return None
+
+def _archive_existing(download_dir: str, new_file: pathlib.Path, archive: bool=True):
+    if not archive:
+        return
+    arch_dir = pathlib.Path(download_dir)/'OldVersions'
+    arch_dir.mkdir(exist_ok=True)
+    for f in pathlib.Path(download_dir).glob('*'):
+        if f.is_file() and f != new_file and f.name != 'OldVersions':
+            try:
+                ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')
+                dest = arch_dir / f"{f.stem}_{ts}{f.suffix}"
+                shutil.move(str(f), dest)
+                log.info('Archived prior export %s -> %s', f.name, dest.name)
+            except Exception as e:
+                log.warning('Failed archiving %s: %s', f, e)
+
+def _maybe_fix_extension(path: pathlib.Path) -> pathlib.Path:
+    """Infer CSV/XLS/XLSX by signature or content if extension is missing or generic.
+    Returns possibly new path.
+    """
+    suffix = path.suffix.lower()
+    if suffix in ('.csv', '.xls', '.xlsx'):
+        return path
+    try:
+        with open(path,'rb') as fh:
+            head = fh.read(8_192)
+    except Exception:
+        return path
+    # XLSX: ZIP signature + presence of '[Content_Types].xml' later (simple check)
+    if head.startswith(b'PK'):
+        new = path.with_suffix('.xlsx')
+        path.rename(new)
+        return new
+    # XLS (BIFF) starts D0 CF 11 E0 A1 B1 1A E1 (OLE CF)
+    if head.startswith(b'\xD0\xCF\x11\xE0'):
+        new = path.with_suffix('.xls')
+        path.rename(new)
+        return new
+    # Heuristic CSV: text, commas, newlines, no binary NUL
+    try:
+        sample_txt = head.decode('utf-8', errors='ignore')
+        if sample_txt.count(',') > 3 and '\n' in sample_txt and '\x00' not in sample_txt:
+            new = path.with_suffix('.csv')
+            path.rename(new)
+            return new
+    except Exception:
+        pass
+    return path
 
 async def _parse_to_dataframe(path: pathlib.Path):
     if pd is None:
@@ -205,17 +421,16 @@ async def export_animals(args):
         try:
             await _wait_for_auth(page, timeout=6.0)
         except Exception:
-            if not (args.user or os.getenv('SOFTMOUSE_USER')) and not args.prompt:
-                raise SystemExit('Not authenticated and no credentials supplied. Provide --user/--password or --prompt.')
-            # Perform login
-            user, pwd = _resolve_credentials(args)
+            # Perform layered credential login
+            user, pwd = get_credentials(args)
             await _try_login(page, user, pwd)
             if args.save_state:
                 await context.storage_state(path=args.state_file)
                 log.info('Saved new storage state to %s', args.state_file)
         await _find_and_click_colony(page, args.colony_name)
         await _goto_animals(page)
-        download_path = await _trigger_export(page, args.download_dir, debug=args.debug_export)
+        download_path = await _export_via_exports_tab(page, args)
+        _archive_existing(args.download_dir, download_path, archive=not args.no_archive)
         df = await _parse_to_dataframe(download_path)
         # Optional save
         if args.output:
@@ -246,6 +461,102 @@ async def _any_selector_exists(page: Page, selector_group: str) -> bool:
             return True
     return False
 
+async def _export_via_exports_tab(page: Page, args) -> pathlib.Path:
+    """Workflow:
+    1. Open Exports tab (via nav or direct URL heuristic).
+    2. Snapshot existing file names.
+    3. Return to Animals (if needed) and click export button.
+    4. Navigate again to Exports tab and poll for a NEW row (xlsx) with timestamp > baseline.
+    5. Click its Download button, capture download (expect_download) or network sniff.
+    6. Save to download_dir.
+    """
+    download_dir = args.download_dir
+    os.makedirs(download_dir, exist_ok=True)
+
+    async def goto_exports():
+        # Try clicking nav; else go to guessed URL
+        try:
+            if await _selector_exists(page, EXPORTS_TAB_SELECTOR):
+                await page.click(EXPORTS_TAB_SELECTOR)
+                await asyncio.sleep(1.0)
+            else:
+                base = re.match(r'^https?://[^/]+', page.url).group(0)
+                await page.goto(base + '/export/history.do', wait_until='load')
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+    await goto_exports()
+    baseline = set()
+    try:
+        rows = await page.query_selector_all('table tr')
+        for r in rows:
+            try:
+                txt = (await r.inner_text()).strip()
+                if '.xls' in txt:
+                    # extract filename section
+                    for part in txt.split():
+                        if part.endswith(('.xls','.xlsx')):
+                            baseline.add(part)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Go back to animals tab if needed (export button present?)
+    if not await _selector_exists(page, EXPORT_BUTTON_SELECTOR):
+        # attempt using history back
+        try:
+            await page.go_back()
+            await asyncio.sleep(1.0)
+        except Exception:
+            pass
+        if not await _selector_exists(page, EXPORT_BUTTON_SELECTOR):
+            await _goto_animals(page)
+
+    # Trigger a new export (best-effort, do not rely on download)
+    try:
+        await page.click(EXPORT_BUTTON_SELECTOR)
+    except Exception:
+        log.warning('Failed to click export button for history-based flow.')
+    await asyncio.sleep(2.0)
+
+    # Return to exports tab and poll for a new entry
+    await goto_exports()
+    new_filename = None
+    start = time.time()
+    while time.time() - start < args.export_timeout:
+        try:
+            rows = await page.query_selector_all('table tr')
+            for r in rows:
+                txt = (await r.inner_text()).strip()
+                if '.xls' not in txt:
+                    continue
+                candidate = None
+                for part in txt.split():
+                    if part.endswith(('.xls','.xlsx')):
+                        candidate = part
+                        break
+                if candidate and candidate not in baseline:
+                    new_filename = candidate
+                    # Attempt to click the Download button in this row
+                    try:
+                        dl_btn = await r.query_selector("text=Download")
+                        if dl_btn:
+                            async with page.expect_download(timeout=15_000) as dl_info:
+                                await dl_btn.click()
+                            download = await dl_info.value
+                            save_path = pathlib.Path(download_dir)/download.suggested_filename
+                            await download.save_as(str(save_path))
+                            log.info('History download saved: %s', save_path)
+                            return _maybe_fix_extension(save_path)
+                    except Exception as e:
+                        log.warning('History row download attempt failed: %s', e)
+            await asyncio.sleep(2.0)
+        except Exception:
+            await asyncio.sleep(2.0)
+    raise ExportError('Failed to retrieve new export via history tab workflow.')
+
 async def _fill_first(page: Page, selector_group: str, value: str):
     for sel in [s.strip() for s in selector_group.split(',') if s.strip()]:
         try:
@@ -268,16 +579,6 @@ async def _click_first(page: Page, selector_group: str):
             continue
     raise ExportError(f'Unable to locate clickable element for selectors: {selector_group}')
 
-def _resolve_credentials(args):
-    user = args.user or os.getenv('SOFTMOUSE_USER')
-    pwd = args.password or os.getenv('SOFTMOUSE_PASSWORD')
-    if args.prompt:
-        user = input('SoftMouse username: ') or user
-        pwd = getpass.getpass('SoftMouse password: ') or pwd
-    if not user or not pwd:
-        raise SystemExit('Missing credentials. Provide --user/--password, environment vars, or --prompt.')
-    return user, pwd
-
 def parse_cli(argv=None):
     ap = argparse.ArgumentParser(description='Export SoftMouse Animals list to DataFrame (no upload).')
     ap.add_argument('--state-file', default='softmouse_storage_state.json', help='Existing storage state JSON (from login script).')
@@ -286,12 +587,17 @@ def parse_cli(argv=None):
     ap.add_argument('--download-dir', default='downloads_animals', help='Directory to save raw downloaded export file')
     ap.add_argument('--output', help='Optional path to write parsed DataFrame (.csv or .parquet)')
     ap.add_argument('--headful', action='store_true', help='Run headed browser for debugging')
-    ap.add_argument('--user', help='Username (overrides env SOFTMOUSE_USER)')
-    ap.add_argument('--password', help='Password (overrides env SOFTMOUSE_PASSWORD)')
-    ap.add_argument('--prompt', action='store_true', help='Prompt for credentials interactively')
+    ap.add_argument('--prompt', action='store_true', help='Prompt for credentials even if env/keyring present')
+    ap.add_argument('--no-keyring', action='store_true', help='Disable keyring lookup/storage for this run')
+    ap.add_argument('--store-credentials', action='store_true', help='Store retrieved (env/prompt) credentials into keyring')
     ap.add_argument('--force-login', action='store_true', help='Ignore stored state and perform fresh login')
     ap.add_argument('--save-state', action='store_true', help='After successful login save/overwrite --state-file')
     ap.add_argument('--debug-export', action='store_true', help='Dump page HTML if export download not captured')
+    ap.add_argument('--export-timeout', type=float, default=30.0, help='Seconds to wait for export download before fallbacks (default 30)')
+    ap.add_argument('--trace-export', action='store_true', help='Record verbose network response metadata to export_log_dir/network_log.json')
+    ap.add_argument('--export-log-dir', default='export_logs', help='Directory to store trace logs when --trace-export is enabled')
+    ap.add_argument('--use-exports-tab', action='store_true', help='Force using Exports history tab workflow (default now automatic)')
+    ap.add_argument('--no-archive', action='store_true', help='Do not move prior exports to OldVersions')
     return ap.parse_args(argv)
 
 def main(argv=None):

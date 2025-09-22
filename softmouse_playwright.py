@@ -27,7 +27,7 @@ Future roadmap:
     - Validate success and capture errors
 """
 from __future__ import annotations
-import os, asyncio, argparse, getpass, sys, time
+import os, asyncio, argparse, getpass, sys, time, hashlib
 from typing import Optional, Tuple
 from app_logging import get_logger
 
@@ -122,15 +122,51 @@ def load_env_file(path: str = '.env') -> None:
         log.warning('Failed loading .env: %s', e)
 
 
-def get_credentials(prompt: bool) -> Tuple[str, str]:
+def _try_keyring():
+    try:
+        import keyring
+        u = keyring.get_password('softmouse', 'username')
+        if u:
+            p = keyring.get_password('softmouse', u)
+            return u, p
+    except Exception:
+        return None, None
+    return None, None
+
+def _store_keyring(user: str, pwd: str):
+    try:
+        import keyring
+        keyring.set_password('softmouse', 'username', user)
+        keyring.set_password('softmouse', user, pwd)
+        log.info('Stored credentials in system keyring (service=softmouse).')
+    except Exception as e:
+        log.warning('Failed storing credentials in keyring: %s', e)
+
+def get_credentials(prompt: bool, allow_keyring: bool=True, store_keyring: bool=False) -> Tuple[str, str]:
+    """Layered sourcing: env -> keyring -> prompt.
+    Only logs source + anonymized user fingerprint.
+    """
+    sources = []
     user = os.getenv('SOFTMOUSE_USER', '').strip()
     pwd = os.getenv('SOFTMOUSE_PASSWORD', '').strip()
-    if prompt:
+    if user and pwd:
+        sources.append('env')
+    elif allow_keyring:
+        ku, kp = _try_keyring()
+        if ku and kp:
+            user, pwd = ku, kp
+            sources.append('keyring')
+    if prompt and (not user or not pwd):
         user = input('SoftMouse username: ').strip() or user
         pwd = getpass.getpass('SoftMouse password: ') or pwd
+        sources.append('prompt')
     if not user or not pwd:
-        print('Missing credentials. Set env vars or use --prompt.', file=sys.stderr)
+        print('Missing credentials. Supply via env, keyring, or --prompt.', file=sys.stderr)
         raise SystemExit(2)
+    if store_keyring and allow_keyring and 'keyring' not in sources:
+        _store_keyring(user, pwd)
+    fingerprint = hashlib.sha256(user.encode('utf-8')).hexdigest()[:8]
+    log.info('Credentials sourced from %s (user fp %s)', '+'.join(sources) or 'unknown', fingerprint)
     return user, pwd
 
 async def login(page, user: str, pwd: str, timeout: float, candidate_urls: list[str], debug: bool = False, screenshot: bool = False):
@@ -288,7 +324,7 @@ async def main_async(args):
     if async_playwright is None:
         raise SystemExit('Playwright not installed. Run: pip install playwright && playwright install')
     load_env_file()
-    user, pwd = get_credentials(prompt=args.prompt)
+    user, pwd = get_credentials(prompt=args.prompt, allow_keyring=not args.no_keyring, store_keyring=args.store_credentials)
     candidate_urls = resolve_base_urls(args.base_url)
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=not args.headful)
@@ -318,7 +354,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--login-only', action='store_true')
     ap.add_argument('--headful', action='store_true', help='Run non-headless for debugging')
-    ap.add_argument('--prompt', action='store_true', help='Prompt for credentials even if env present')
+    ap.add_argument('--prompt', action='store_true', help='Prompt for credentials even if env/keyring present')
+    ap.add_argument('--no-keyring', action='store_true', help='Disable keyring lookup/storage')
+    ap.add_argument('--store-credentials', action='store_true', help='Store credentials in keyring after retrieval')
     ap.add_argument('--timeout', type=float, default=20.0, help='Login timeout seconds (default 20)')
     ap.add_argument('--base-url', help='Override base URL (will try fallbacks if fails)')
     ap.add_argument('--debug', action='store_true', help='Dump page HTML on each failed attempt')

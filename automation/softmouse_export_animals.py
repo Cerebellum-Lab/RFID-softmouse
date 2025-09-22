@@ -218,6 +218,7 @@ async def export_animals(args):
         t_export_click = _now(); export_start_wall = time.time()
         # Network response fallback container
         response_capture: dict[str, pathlib.Path | bytes | None] = {'path': None, 'body': None}
+        taskid_capture: dict[str, str | None] = {'taskid': None}
 
         async def _capture_response(resp):  # executed in task when potential export response detected
             try:
@@ -257,6 +258,17 @@ async def export_animals(args):
                 url_l = resp.url.lower()
                 if args.debug_network:
                     log.info('[NET] %s | %s | dispo=%s', resp.url, ctype or '(none)', dispo or '(none)')
+                # Capture taskid early from any export-related request/response URL
+                if 'taskid=' in url_l and taskid_capture.get('taskid') is None:
+                    try:
+                        from urllib.parse import urlparse, parse_qs
+                        qs = parse_qs(urlparse(resp.url).query)
+                        tid = qs.get('taskid', [None])[0]
+                        if tid:
+                            taskid_capture['taskid'] = tid
+                            log.info('Captured export taskid=%s from %s', tid, resp.url)
+                    except Exception:
+                        pass
                 trigger = (
                     'attachment' in dispo or
                     'application/vnd.ms-excel' in ctype or
@@ -291,6 +303,53 @@ async def export_animals(args):
             t_wait = _now(); path_final = await _wait_for_native_download(context, args); log.info('[TIMER] download complete (fallback listener) (%s)', _fmt_dur(t_wait))
         if not path_final and response_capture['path']:
             path_final = response_capture['path']  # type: ignore[assignment]
+            # SUCCESS placeholder detection & direct-only modes
+            if path_final and path_final.exists() and path_final.stat().st_size < 1024:
+                tiny_ok = False
+                try:
+                    with open(path_final,'rb') as fh: raw = fh.read(32)
+                    txt = raw.decode('utf-8','ignore').strip('"\'')
+                    tiny_ok = (txt.upper() == 'SUCCESS')
+                except Exception:
+                    txt = ''
+                if tiny_ok and taskid_capture['taskid']:
+                    log.info('Detected SUCCESS placeholder (%d bytes). Strategy A navigation.', path_final.stat().st_size)
+                    real = await _direct_taskid_download(context, args.base_url, taskid_capture['taskid'], args.download_wait)
+                    if real:
+                        path_final = real; response_capture['path'] = real
+                        log.info('Strategy A succeeded: %s', real.name)
+                    elif args.direct_only:
+                        log.info('--direct-only: attempting cookie replay for taskid=%s', taskid_capture['taskid'])
+                        replay = await _cookie_replay_download(context, args.base_url, taskid_capture['taskid'])
+                        if replay:
+                            path_final = replay; response_capture['path'] = replay
+                            log.info('Cookie replay succeeded: %s', replay.name)
+                        else:
+                            raise ExportError('Direct-only: navigation + cookie replay failed (placeholder only).')
+                    else:
+                        log.warning('Strategy A navigation failed; will continue with fallbacks (not direct-only).')
+                elif args.direct_only:
+                    raise ExportError('Direct-only: expected SUCCESS placeholder with taskid; conditions not met.')
+
+        if args.direct_only:
+            if not path_final or path_final.stat().st_size < 1024:
+                raise ExportError('Direct-only final validation failed: file missing or too small.')
+            log.info('--direct-only: skipping export log + OS fallback.')
+        else:
+            # Attempt Export Log workflow if still nothing
+            if not path_final:
+                t_log = _now();
+                try:
+                    path_final = await _attempt_export_log_workflow(context, page, args, export_start_wall)
+                    if path_final:
+                        log.info('[TIMER] export log retrieval complete (%s)', _fmt_dur(t_log))
+                except Exception as e:
+                    log.warning('Export log workflow failed: %s', e)
+            if not path_final:
+                t_os = _now(); path_final = _scan_os_downloads(args, export_start_wall)
+                if path_final: log.info('[TIMER] download detected via OS fallback (%s)', _fmt_dur(t_os))
+            if not path_final:
+                raise ExportError('No download detected within wait window (expect, listener, and OS scan failed).')
         # Attempt Export Log workflow if still nothing (site may now queue export and require manual retrieval)
         if not path_final:
             t_log = _now();
@@ -525,6 +584,88 @@ async def _attempt_export_log_workflow(context, page, args, export_start_wall: f
         log.debug('Export log workflow internal error: %s', e)
     return None
 
+async def _direct_taskid_download(context, base_url: str, taskid: str, wait_seconds: float) -> pathlib.Path | None:
+    """Attempt to force a real browser download via top-level navigation using the known taskid.
+
+    We open a temporary page and navigate directly to the downLoadFile endpoint. If Playwright emits a
+    download event we materialize it; otherwise we attempt to capture via network listener fallback.
+    """
+    if not taskid:
+        return None
+    # Normalize base
+    if base_url.endswith('/'):
+        base = base_url.rstrip('/')
+    else:
+        base = base_url
+    url = f"{base}/export/downLoadFile?taskid={taskid}"
+    log.info('Strategy A: direct navigation to %s', url)
+    page = await context.new_page()
+    timeout_ms = int(min(wait_seconds, 30) * 1000)
+    try:
+        async with context.expect_event('download', timeout=timeout_ms) as dl_info:
+            await page.goto(url, wait_until='domcontentloaded')
+        download = await dl_info.value
+        real_path = await _materialize_download(download)
+        await page.close()
+        return real_path
+    except Exception as e:
+        log.warning('Strategy A navigation did not yield download event: %s', e)
+        try:
+            await page.close()
+        except Exception:
+            pass
+    return None
+
+async def _cookie_replay_download(context, base_url: str, taskid: str) -> pathlib.Path | None:
+    """Replay request using session cookies via requests to fetch the real binary.
+
+    Returns a path or None. Only used in --direct-only mode when navigation did not yield a download.
+    """
+    try:
+        import requests  # rely on existing dependency (already in requirements)
+    except Exception as e:
+        log.warning('Cookie replay unavailable (requests missing): %s', e); return None
+    if not taskid:
+        return None
+    base = base_url.rstrip('/')
+    url = f"{base}/export/downLoadFile?taskid={taskid}"
+    # Build cookie header from context storage state
+    try:
+        state = await context.storage_state()
+        cookies = state.get('cookies', []) if isinstance(state, dict) else []
+        cookie_header = '; '.join(f"{c['name']}={c['value']}" for c in cookies if 'name' in c and 'value' in c)
+    except Exception as e:
+        log.warning('Failed extracting cookies for replay: %s', e); return None
+    log.info('Cookie replay GET %s', url)
+    try:
+        resp = requests.get(url, headers={'Cookie': cookie_header, 'Accept': '*/*'}, timeout=60)
+    except Exception as e:
+        log.warning('Cookie replay request failed: %s', e); return None
+    if resp.status_code != 200:
+        log.warning('Cookie replay non-200 status: %s', resp.status_code); return None
+    data = resp.content
+    if len(data) < 1024 and data.strip().decode('utf-8','ignore').upper().strip('\"\'') == 'SUCCESS':
+        log.warning('Cookie replay still received SUCCESS placeholder (not real file).'); return None
+    # Determine filename from headers
+    dispo = resp.headers.get('Content-Disposition','')
+    name = None
+    if 'filename' in dispo:
+        part = dispo.split('filename')[-1]
+        for sep in ('*=utf-8''','="','=',):
+            if sep in part:
+                name = part.split(sep,1)[-1].strip().strip('"').split(';')[0]
+                break
+    if not name:
+        name = f'softmouse_export_{taskid}.xlsx'
+    target = pathlib.Path(tempfile.gettempdir())/name
+    try:
+        with open(target,'wb') as fh: fh.write(data)
+        log.info('Cookie replay wrote %s (%d bytes)', target.name, len(data))
+        return target
+    except Exception as e:
+        log.warning('Cookie replay write failed: %s', e)
+    return None
+
 async def _parse_to_dataframe(path: pathlib.Path):
     if pd is None: raise ExportError('pandas not installed; cannot parse export.')
     suffix = path.suffix.lower()
@@ -585,6 +726,7 @@ def parse_cli(argv=None):
     ap.add_argument('--no-archive', action='store_true', help='Do not archive prior exports')
     ap.add_argument('--os-download-dir', help='Absolute path to system/OS download directory to poll as last-resort (e.g. %USERPROFILE%/Downloads)')
     ap.add_argument('--debug-network', action='store_true', help='Log network responses during export window for troubleshooting')
+    ap.add_argument('--direct-only', action='store_true', help='Fast path: expect SUCCESS placeholder + taskid then perform direct navigation and cookie replay. Skip other fallbacks.')
     return ap.parse_args(argv)
 
 def main(argv=None):

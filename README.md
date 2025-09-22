@@ -1,129 +1,111 @@
-# RFID-softmouse
+## RFID-softmouse (Simplified Core)
 
-Local + optional Postgres mirror for SoftMouse colony data keyed by RFID, with FastAPI services for rapid metadata lookups in acquisition workflows.
+This repository has been reduced to the essential tooling used in daily workflows:
 
-## Current Capabilities (SQLite Path)
-* SQLite mirror schema (`db.py`) with mice + genotypes
-* CSV ETL loader (`etl_softmouse.py`)
-* FastAPI service (`fastapi_service.py`) for `/mouse/{rfid}` queries
-* GUI integration (RFID lookup) in acquisition script (not detailed here)
+1. Automated SoftMouse export + credential handling (Playwright).
+2. Real‑time multi‑camera acquisition + Arduino pellet delivery + compression.
+3. Optional RFID lookup utilities (local / HTTP fallback) integrated with acquisition.
 
-## Advanced: Postgres Mirror
-If you need multi-user concurrency, richer relational queries, or write-back staging, use the Postgres components.
+All Postgres / ETL / legacy HTML pages and auxiliary API scaffolding have been removed for clarity.
 
-### Components
-| File | Purpose |
-|------|---------|
-| `pg_schema.sql` | Core tables + materialized view `mouse_full` |
-| `pg_init.py` | Apply schema & refresh materialized view |
-| `pg_etl.py` | Load exported CSVs into Postgres, refresh view |
-| `pg_api.py` | FastAPI API over Postgres mirror |
-| `writeback_queue.py` | Append-only queue for desired mutations |
-| `apply_patches_job.py` | Stub processor for queued patches |
-
-### Quick Start (Postgres)
-```powershell
-# 1. Set DSN (example)
-$env:PG_DSN = "postgresql://postgres:postgres@localhost:5432/softmouse"
-
-# 2. Apply schema
-python .\pg_init.py
-
-# 3. Place exports
-#   .\exports\mice.csv
-#   .\exports\genotypes.csv
-#   .\exports\cages.csv
-#   .\exports\matings.csv
-#   .\exports\litters.csv
-
-# 4. Run ETL
-python .\pg_etl.py --exports .\exports
-
-# 5. Start API
-uvicorn pg_api:app --host 127.0.0.1 --port 8090 --reload
-
-# 6. Query
-curl http://127.0.0.1:8090/mouse/ABC123
+### Directory Layout
+```
+automation/                SoftMouse automation (login + export)
+	softmouse_export_animals.py
+	softmouse_playwright.py
+acquisition/               Acquisition, compression, camera + Arduino control
+	arduinoCtrl_v5.py
+	multiCam_DLC_PySpin_v2.py
+	multiCam_DLC_utils_v2.py
+	multiCam_RT_videoAcquisition_v5.py
+	compressVideos_v3.py
+	systemdata.yaml          (moved here from project root)
+rfid/                      RFID helpers (wrappers kept for future refactor)
+	rfid_lookup.py
+	rfid_serial_listener.py
+logs/                      Central log output (app.log)
+Users/                     Per‑user GUI preference YAML (ignored by git)
 ```
 
-### Materialized View
-`mouse_full` flattens per-RFID data (genotypes, cage history) for ultra-fast single-row lookups. ETL refreshes it with `REFRESH MATERIALIZED VIEW CONCURRENTLY` to avoid blocking readers.
+### Credential Layering (Automation Scripts)
+Both `softmouse_export_animals.py` and `softmouse_playwright.py` resolve credentials in this order:
+1. Environment variables: `SOFTMOUSE_USER`, `SOFTMOUSE_PASSWORD`
+2. System keyring (if available; can be skipped with `--no-keyring`)
+3. Interactive prompt (non‑echo for password). Optionally store with `--store-credentials`.
 
-### Write-Back Queue Concept
+No username/password CLI flags are required or accepted anymore.
+
+### SoftMouse Export Usage
+Download the native `.xlsx` (no mutation) and optionally parse to CSV/JSON if desired.
+
 ```powershell
-# Enqueue a cage change
-python .\writeback_queue.py enqueue --op update_mouse --rfid ABC123 --change cage_id=C-120
-
-# List queued patches
-python .\writeback_queue.py list
-
-# Process (stub prints)
-python .\apply_patches_job.py
+python .\automation\softmouse_export_animals.py --colony-name "Colony Name" --headful --download-wait 75 --parse
 ```
-Future: Implement Playwright automation: apply forms or batch import, then mark queue entries `status=applied` or `status=error`.
+Key flags:
+* `--headful`            Launch visible Chromium (omit for headless).
+* `--download-wait N`    Seconds to wait for native download (default 60).
+* `--parse`              Parse downloaded file into a Pandas DataFrame (logged only; add your own persistence if needed).
+* `--browser-download-dir PATH`  Override default browser download folder discovery.
+* `--download-trace`     Extra per‑phase timing logs even if not verbose.
+* `--store-credentials`  Persist prompted credentials to keyring.
 
-### Choosing a Path
-| Scenario | Use |
-|----------|-----|
-| Single rig, offline tolerant | SQLite only |
-| Multiple rigs, shared colony state | Postgres mirror |
-| Need audited edits / write-back | Postgres + queue |
+Timing + diagnostics logged (bytes, first hex bytes, short hash). The script exits non‑zero if the download does not appear within the timeout.
 
-### Refresh Scheduling
-Run `pg_etl.py` hourly via Windows Task Scheduler or cron (WSL / server). For most colonies, hourly is sufficient.
+### Login Test Only
+```powershell
+python .\automation\softmouse_playwright.py --login-only --headful
+```
+Exports a reusable `softmouse_storage_state.json` for future authenticated contexts (Playwright).
 
-### License / Attribution
-Internal tooling scaffold. Add license details here if distributing.
+### Multi‑Camera Acquisition GUI
+The GUI (wxPython + Matplotlib) coordinates:
+* PySpin / Spinnaker camera acquisition
+* Live preview + ROI + pellet/stimulus ROI alignment
+* Automated pellet delivery logic (Arduino serial)
+* Optional RFID metadata linking (writes metalink entries processed post‑compression)
+* Background compression to H.264 (`compressVideos_v3.py`) with metadata propagation
+
+Launch (ensure dependencies + camera drivers installed):
+```powershell
+python .\acquisition\multiCam_RT_videoAcquisition_v5.py
+```
+
+`systemdata.yaml` now lives inside `acquisition/` so relative imports (e.g., `multiCam_DLC_utils_v2.read_config()`) continue to work after refactor.
+
+### RFID Utilities
+Standalone serial listener:
+```powershell
+python .\rfid\rfid_serial_listener.py --auto --raw
+```
+Lookup helper (used by GUI) attempts HTTP FastAPI first (if you later re‑introduce it), then falls back to local DB (legacy code paths retained but external DB modules were removed—adjust if needed).
+
+### Logs
+Unified logging goes to `logs/app.log`. Adjust formatting or rotation in `app_logging.py`.
+
+### Users Directory
+`Users/` stores per‑user preference YAMLs plus `prev_user.txt`. It is ignored by git (`.gitignore`) so local personalization does not create noise.
+
+### Dependencies
+See `requirements.txt`. Ensure PySpin / Spinnaker SDK and appropriate camera drivers are installed separately (not pip-installable). For Playwright:
+```powershell
+pip install -r requirements.txt
+playwright install
+```
+
+### Minimal Example: End‑to‑End Export
+```powershell
+set SOFTMOUSE_USER=your_user
+set SOFTMOUSE_PASSWORD=your_pass
+python .\automation\softmouse_export_animals.py --colony-name "Example Colony" --headful
+```
+
+### Roadmap / Next Ideas
+* Inline CLI flag to persist parsed animal table to CSV/Parquet.
+* Replace remaining root import reliance in migrated acquisition modules (currently some use original names for backwards compatibility) with fully internal relative imports.
+* Optional lightweight FastAPI re‑add strictly for RFID if needed.
+
+### License
+Internal research tooling. Add an explicit LICENSE file before external distribution.
 
 ---
-Generated scaffolding includes placeholders; extend with authentication, logging, and error handling before production use.
-
-## Authentication (Token Placeholder)
-Both APIs (`fastapi_service.py` and `pg_api.py`) now support optional token protection using `auth_placeholder.py`.
-
-Setup:
-1. Create a file `auth_tokens.txt` with one token per line (e.g. `devtoken123`).
-2. Or set environment variable `AUTH_TOKEN` to a single token.
-3. Start the service. Endpoints (except `/health`) require header:
-	`Authorization: Bearer devtoken123`
-
-Example:
-```powershell
-curl -H "Authorization: Bearer devtoken123" http://127.0.0.1:8090/mouse/ABC123
-```
-
-## Extended Postgres API Endpoints
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | no | Service / DB status |
-| `/mouse/{rfid}` | GET | yes | Single mouse record from `mouse_full` |
-| `/refresh` | POST | yes | Manually refresh `mouse_full` materialized view |
-| `/queue` | GET | yes | List queued patches (optional `?status=pending`) |
-| `/queue/{rfid}` | GET | yes | List patches for a specific RFID |
-
-SQLite API (`fastapi_service.py`):
-| Endpoint | Method | Auth |
-|----------|--------|------|
-| `/health` | GET | no |
-| `/mouse/{rfid}` | GET | yes |
-| `/reload` | POST | yes |
-| `/` | GET | yes |
-
-## Manual Refresh vs ETL
-`/refresh` only re-materializes the view; it does not import new data. Use ETL first, then refresh (ETL script already refreshes automatically). Use `/refresh` if you alter underlying tables outside ETL.
-
-## Queue Status Lifecycle
-`writeback_queue.py` entries transition: `pending -> processing -> done|error`.
-`apply_patches_job.py run` (when implemented) should set `processing` during work; current stub sets `done` directly.
-
-## Windows Task Scheduler XML Samples
-Import `task_hourly_etl.xml` for hourly ETL and `task_patch_job.xml` for periodic patch attempts. Edit the `<StartBoundary>` and credentials to match your environment.
-
-## Playwright Automation Skeleton
-`softmouse_playwright.py` holds login placeholder. After installing:
-```powershell
-pip install playwright
-playwright install
-python .\softmouse_playwright.py --login-only --headful
-```
-Replace CSS selectors and add navigation/upload steps before enabling production use.
+Refactor summary: Removed ETL / DB / HTML artifacts. Focus now on robust acquisition & export workflows with clear logging and secure credential handling.

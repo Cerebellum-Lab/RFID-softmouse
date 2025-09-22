@@ -206,9 +206,10 @@ async def export_animals(args):
             user, pwd = get_credentials(args)
             await _try_login(page, user, pwd)
             log.info('[TIMER] interactive login completed (%s)', _fmt_dur(t_login))
-            if args.save_state:
-                await context.storage_state(path=args.state_file)
-                log.info('Saved new storage state to %s', args.state_file)
+            # Defer saving state until animals page is reached (so future fast loads land there quickly)
+            save_state_deferred = bool(args.save_state)
+        else:
+            save_state_deferred = False
         # Fast-path option: if user requests --fast-animals and we used a stored state, jump directly.
         if args.fast_animals and state_exists and not args.force_login:
             base_root = args.base_url.rstrip('/')
@@ -222,6 +223,13 @@ async def export_animals(args):
         else:
             t_colony = _now(); await _find_and_click_colony(page, args.colony_name); log.info('[TIMER] colony nav complete (%s)', _fmt_dur(t_colony))
             t_animals = _now(); await _goto_animals(page); log.info('[TIMER] animals page reached (%s)', _fmt_dur(t_animals))
+        # Now safe to persist state (after animals page reached) if deferred
+        try:
+            if 'save_state_deferred' in locals() and save_state_deferred:
+                await context.storage_state(path=args.state_file)
+                log.info('Saved new storage state to %s (post-animals page)', args.state_file)
+        except Exception as e:
+            log.warning('Deferred state save failed: %s', e)
         # --- Simplified Strategy A only: click export -> capture taskid -> cookie replay (with optional direct navigation attempt) ---
         export_start_wall = time.time()
         taskid_capture: dict[str, str | None] = {'taskid': None}

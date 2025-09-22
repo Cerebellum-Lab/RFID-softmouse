@@ -13,6 +13,14 @@ from pathlib import PurePath
 import cv2
 import multiCam_DLC_utils_v2 as clara
 import shutil
+import pathlib, sys as _sys
+# Path bootstrap to import root-level app_logging when running from acquisition/
+try:
+    _ROOT = pathlib.Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(_ROOT))
+except Exception:
+    pass
 from app_logging import get_logger
 import json, pathlib, datetime as _dt
 

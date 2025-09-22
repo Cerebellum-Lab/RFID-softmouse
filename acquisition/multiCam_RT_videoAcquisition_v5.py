@@ -25,6 +25,16 @@ import shutil
 from pathlib import Path
 import ruamel.yaml
 import winsound
+
+# --- Path bootstrap to allow running this script from nested acquisition/ folder ---
+import pathlib, sys as _sys
+try:
+    _ROOT = pathlib.Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(_ROOT))
+except Exception:
+    pass
+
 from app_logging import get_logger
 
 # ###########################################################################
@@ -344,39 +354,14 @@ class MainFrame(wx.Frame):
         self.rfid_lookup.Bind(wx.EVT_BUTTON, self.lookupRFID)
         vpos+=1
 
-        # SoftMouse export controls (animals metadata)
-        sm_box_label = wx.StaticText(self.widget_panel, label='SoftMouse Colony:')
-        wSpacer.Add(sm_box_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.softmouse_colony = wx.TextCtrl(self.widget_panel, id=wx.ID_ANY, value="")
-        wSpacer.Add(self.softmouse_colony, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
-        self.softmouse_load_btn = wx.Button(self.widget_panel, id=wx.ID_ANY, label="Load Animals")
-        wSpacer.Add(self.softmouse_load_btn, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.softmouse_load_btn.Bind(wx.EVT_BUTTON, self.startAnimalExport)
-        vpos+=1
-        self.softmouse_fast = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Fast")
-        wSpacer.Add(self.softmouse_fast, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.softmouse_headful = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Headful")
-        wSpacer.Add(self.softmouse_headful, pos=(vpos,1), span=(0,1), flag=wx.LEFT, border=wSpace)
+        # Animals status (SoftMouse configuration moved to Config->SoftMouse Config)
         self.softmouse_status = wx.StaticText(self.widget_panel, label='Animals: none loaded')
-        wSpacer.Add(self.softmouse_status, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        wSpacer.Add(self.softmouse_status, pos=(vpos,0), span=(0,3), flag=wx.LEFT, border=wSpace)
         vpos+=1
 
-        # RFID auto listener controls
-        rfid_listen_label = wx.StaticText(self.widget_panel, label='RFID Port:')
-        wSpacer.Add(rfid_listen_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.rfid_port = wx.TextCtrl(self.widget_panel, id=wx.ID_ANY, value="COM3")
-        wSpacer.Add(self.rfid_port, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
-        self.rfid_toggle = wx.ToggleButton(self.widget_panel, id=wx.ID_ANY, label='RFID Listen')
-        wSpacer.Add(self.rfid_toggle, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.rfid_toggle.Bind(wx.EVT_TOGGLEBUTTON, self.toggleRFIDListener)
-        vpos+=1
-        baud_label = wx.StaticText(self.widget_panel, label='Baud:')
-        wSpacer.Add(baud_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.rfid_baud = wx.SpinCtrl(self.widget_panel, value='9600', size=(70,-1))
-        self.rfid_baud.SetRange(1200, 115200)
-        wSpacer.Add(self.rfid_baud, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
+        # RFID listener controls moved to Config->RFID Config dialog. Provide minimal status inline.
         self.rfid_status = wx.StaticText(self.widget_panel, label='RFID idle')
-        wSpacer.Add(self.rfid_status, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        wSpacer.Add(self.rfid_status, pos=(vpos,0), span=(0,3), flag=wx.LEFT, border=wSpace)
         vpos+=1
 
         start_text = wx.StaticText(self.widget_panel, label='Stim on:')
@@ -543,7 +528,45 @@ class MainFrame(wx.Frame):
         
         self.canvas.mpl_connect('button_press_event', self.onClick)
         self.Bind(wx.EVT_CHAR_HOOK, self.OnKeyPressed)
-    
+
+        # ---------------- Menu Bar (Config) ----------------
+        menubar = wx.MenuBar()
+        config_menu = wx.Menu()
+        self.menu_softmouse_cfg = config_menu.Append(wx.ID_ANY, 'SoftMouse Config\tCtrl+M')
+        self.menu_rfid_cfg = config_menu.Append(wx.ID_ANY, 'RFID Config\tCtrl+R')
+        menubar.Append(config_menu, '&Config')
+        self.SetMenuBar(menubar)
+        # Import dialogs now that menu is created (deferred import to keep top clean)
+        from acquisition.config_dialogs import SoftMouseConfigDialog, RFIDConfigDialog  # noqa: E402
+        self._SoftMouseConfigDialogClass = SoftMouseConfigDialog
+        self._RFIDConfigDialogClass = RFIDConfigDialog
+        self.Bind(wx.EVT_MENU, self.onOpenSoftMouseConfig, self.menu_softmouse_cfg)
+        self.Bind(wx.EVT_MENU, self.onOpenRFIDConfig, self.menu_rfid_cfg)
+
+    # ---------------- Dialog open handlers (stubs) ----------------
+    def onOpenSoftMouseConfig(self, event):
+        try:
+            dlg = self._SoftMouseConfigDialogClass(self)
+            dlg.ShowModal()
+        finally:
+            try:
+                dlg.Destroy()
+            except Exception:
+                pass
+
+    def onOpenRFIDConfig(self, event):
+        try:
+            dlg = self._RFIDConfigDialogClass(self)
+            dlg.ShowModal()
+        finally:
+            try:
+                dlg.Destroy()
+            except Exception:
+                pass
+
+    #############################################################################################################
+    # (Removed inline dialog class definitions; imported above in __init__)
+
     def write_user_config(self):
         usrdatadir = os.path.dirname(os.path.realpath(__file__))
         configname = os.path.join(usrdatadir, 'Users', self.user_drop.GetStringSelection() + '_userdata.yaml')
@@ -666,7 +689,15 @@ class MainFrame(wx.Frame):
         if getattr(self, 'animal_export_active', False):
             self.log.warning('Animal export already running')
             return
-        colony = self.softmouse_colony.GetValue().strip()
+        # Retrieve colony name from dialog-sourced attribute or fallback to blank
+        colony = ''
+        if hasattr(self, 'softmouse_colony') and isinstance(self.softmouse_colony, wx.TextCtrl):
+            try:
+                colony = self.softmouse_colony.GetValue().strip()
+            except Exception:
+                colony = ''
+        if not colony and hasattr(self, '_softmouse_last_colony'):
+            colony = (self._softmouse_last_colony or '').strip()
         if not colony:
             self.statusbar.SetStatusText('Enter colony name for SoftMouse export')
             return
@@ -680,8 +711,8 @@ class MainFrame(wx.Frame):
         self.animal_export_queue = mp.Queue()
         self.animal_export_proc = mp.Process(target=run_export, args=(
             colony,
-            bool(self.softmouse_fast.GetValue()),
-            bool(self.softmouse_headful.GetValue()),
+            bool(getattr(self, 'softmouse_fast', None) and self.softmouse_fast.GetValue()) if hasattr(self,'softmouse_fast') else bool(getattr(self,'_softmouse_fast_flag', False)),
+            bool(getattr(self, 'softmouse_headful', None) and self.softmouse_headful.GetValue()) if hasattr(self,'softmouse_headful') else bool(getattr(self,'_softmouse_headful_flag', False)),
             'softmouse_storage_state.json',
             'downloads_animals',
             self.animal_export_queue,

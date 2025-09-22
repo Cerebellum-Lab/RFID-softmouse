@@ -6,6 +6,14 @@ Created on Tue Jul 23 10:26:20 2019
 @author: bioelectrics
 """
 import sys, linecache
+# --- Path bootstrap to ensure root modules (app_logging) import when executed from acquisition/ ---
+try:
+    import pathlib as _pathlib, sys as _sys
+    _ROOT = _pathlib.Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(_ROOT))
+except Exception:
+    pass
 from app_logging import get_logger
 from multiprocessing import Process
 from queue import Empty

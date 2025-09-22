@@ -230,6 +230,14 @@ async def export_animals(args):
                 log.info('Saved new storage state to %s (post-animals page)', args.state_file)
         except Exception as e:
             log.warning('Deferred state save failed: %s', e)
+        # If running in login-only mode, exit now after successful navigation/state persistence.
+        if getattr(args, 'login_only', False):
+            log.info('--login-only specified: ending session after animals page verification.')
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            return
         # --- Simplified Strategy A only: click export -> capture taskid -> cookie replay (with optional direct navigation attempt) ---
         export_start_wall = time.time()
         taskid_capture: dict[str, str | None] = {'taskid': None}
@@ -490,6 +498,7 @@ def parse_cli(argv=None):
     ap.add_argument('--save-state', action='store_true', help='After successful login save/overwrite --state-file')
     ap.add_argument('--no-archive', action='store_true', help='Do not archive prior exports')
     ap.add_argument('--debug-network', action='store_true', help='Log network responses during export window for troubleshooting')
+    ap.add_argument('--login-only', action='store_true', help='Stop after reaching animals page (no export/download).')
     return ap.parse_args(argv)
 
 def main(argv=None):

@@ -19,40 +19,54 @@ if str(ROOT) not in sys.path:
 from automation.softmouse_export_animals import parse_cli, export_animals  # type: ignore
 
 
-def _args_for(colony: str, fast: bool, headful: bool, state_file: str, download_dir: str) -> list[str]:
+def _args_for(colony: str, fast: bool, headful: bool, state_file: str, download_dir: str, login_only: bool=False, force_login: bool=False, save_state: bool=False) -> list[str]:
     argv = [
         '--colony-name', colony,
         '--state-file', state_file,
         '--download-dir', download_dir,
-        '--parse',  # ensure parsing executed (DataFrame head printed inside)
         '--download-wait', '60',
     ]
+    if not login_only:
+        argv.append('--parse')  # retain original behavior for full export
     if fast:
         argv.append('--fast-animals')
     if headful:
         argv.append('--headful')
+    if login_only:
+        argv.append('--login-only')
+    if force_login:
+        argv.append('--force-login')
+    if save_state:
+        argv.append('--save-state')
     # rely on existing stored state; no force-login by default
     return argv
 
-async def _run_export(argv: list[str]) -> Dict[str, Any]:
+async def _run_export(argv: list[str], login_only: bool) -> Dict[str, Any]:
     start = time.time()
     ns = parse_cli(argv)
     try:
         await export_animals(ns)
-        # Determine latest file in download_dir
-        dl_dir = pathlib.Path(ns.download_dir)
-        latest: Optional[pathlib.Path] = None
-        if dl_dir.exists():
-            for f in dl_dir.glob('*.*'):
-                if f.is_file() and f.suffix.lower() in ('.csv', '.xlsx'):
-                    if (latest is None) or f.stat().st_mtime > latest.stat().st_mtime:
-                        latest = f
-        return {
-            'ok': True,
-            'elapsed': round(time.time()-start, 2),
-            'file': str(latest) if latest else None,
-            'format': latest.suffix if latest else None,
-        }
+        if login_only:
+            return {
+                'ok': True,
+                'elapsed': round(time.time()-start, 2),
+                'login_only': True,
+            }
+        else:
+            # Determine latest file in download_dir
+            dl_dir = pathlib.Path(ns.download_dir)
+            latest: Optional[pathlib.Path] = None
+            if dl_dir.exists():
+                for f in dl_dir.glob('*.*'):
+                    if f.is_file() and f.suffix.lower() in ('.csv', '.xlsx'):
+                        if (latest is None) or f.stat().st_mtime > latest.stat().st_mtime:
+                            latest = f
+            return {
+                'ok': True,
+                'elapsed': round(time.time()-start, 2),
+                'file': str(latest) if latest else None,
+                'format': latest.suffix if latest else None,
+            }
     except Exception as e:  # pragma: no cover
         return {
             'ok': False,
@@ -60,14 +74,14 @@ async def _run_export(argv: list[str]) -> Dict[str, Any]:
             'trace': traceback.format_exc(limit=8),
         }
 
-def run_export(colony: str, fast: bool, headful: bool, state_file: str, download_dir: str, q: mp.Queue):
+def run_export(colony: str, fast: bool, headful: bool, state_file: str, download_dir: str, q: mp.Queue, login_only: bool=False, force_login: bool=False, save_state: bool=False):
     """Entry point executed in a child process.
 
     Places exactly one dict onto queue describing result.
     """
     try:
-        argv = _args_for(colony, fast, headful, state_file, download_dir)
-        res = asyncio.run(_run_export(argv))
+        argv = _args_for(colony, fast, headful, state_file, download_dir, login_only=login_only, force_login=force_login, save_state=save_state)
+        res = asyncio.run(_run_export(argv, login_only=login_only))
     except SystemExit as e:  # argparse may call sys.exit
         res = {'ok': False, 'error': f'SystemExit {e}'}
     except Exception as e:  # pragma: no cover

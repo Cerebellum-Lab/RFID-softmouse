@@ -20,41 +20,32 @@ class SoftMouseConfigDialog(wx.Dialog):
 
         # Colony name
         grid.Add(wx.StaticText(pnl, label='Colony Name:'), 0, wx.ALIGN_CENTER_VERTICAL)
-        colony_val = ''
-        if hasattr(parent, 'softmouse_colony') and isinstance(parent.softmouse_colony, wx.TextCtrl):
-            try:
-                colony_val = parent.softmouse_colony.GetValue()
-            except Exception:
-                colony_val = ''
+        colony_val = getattr(parent, '_softmouse_last_colony', '') or ''
         self.txt_colony = wx.TextCtrl(pnl, value=colony_val)
         grid.Add(self.txt_colony, 1, wx.EXPAND)
 
         # Fast / Headful
         grid.Add(wx.StaticText(pnl, label='Fast Animals:'), 0, wx.ALIGN_CENTER_VERTICAL)
         self.chk_fast = wx.CheckBox(pnl)
-        if hasattr(parent, 'softmouse_fast') and isinstance(parent.softmouse_fast, wx.CheckBox):
-            try:
-                self.chk_fast.SetValue(parent.softmouse_fast.GetValue())
-            except Exception:
-                pass
+        self.chk_fast.SetValue(bool(getattr(parent, '_softmouse_fast_flag', False)))
         grid.Add(self.chk_fast)
 
         grid.Add(wx.StaticText(pnl, label='Headful Browser:'), 0, wx.ALIGN_CENTER_VERTICAL)
         self.chk_headful = wx.CheckBox(pnl)
-        if hasattr(parent, 'softmouse_headful') and isinstance(parent.softmouse_headful, wx.CheckBox):
-            try:
-                self.chk_headful.SetValue(parent.softmouse_headful.GetValue())
-            except Exception:
-                pass
+        self.chk_headful.SetValue(bool(getattr(parent, '_softmouse_headful_flag', False)))
         grid.Add(self.chk_headful)
 
         # Force login, Save state, Parse
-        self.chk_force_login = wx.CheckBox(pnl, label='Force fresh login')
+    self.chk_force_login = wx.CheckBox(pnl, label='Force fresh login')
         grid.Add(self.chk_force_login, 0, wx.ALIGN_LEFT)
-        self.chk_save_state = wx.CheckBox(pnl, label='Save state after login')
+    self.chk_save_state = wx.CheckBox(pnl, label='Save state after login')
         grid.Add(self.chk_save_state, 0, wx.ALIGN_LEFT)
-        self.chk_parse = wx.CheckBox(pnl, label='Parse exported file')
+    self.chk_parse = wx.CheckBox(pnl, label='Parse exported file')
         grid.Add(self.chk_parse, 0, wx.ALIGN_LEFT)
+    # Initialize flag checkboxes from parent attributes if present
+    self.chk_force_login.SetValue(bool(getattr(parent, '_softmouse_force_login', False)))
+    self.chk_save_state.SetValue(bool(getattr(parent, '_softmouse_save_state', False)))
+    self.chk_parse.SetValue(bool(getattr(parent, '_softmouse_parse', True)))
 
         # Spacer
         grid.Add((5, 5))
@@ -84,28 +75,73 @@ class SoftMouseConfigDialog(wx.Dialog):
 
     def _persist_to_parent(self):
         # Mirror dialog values into parent legacy widgets/attributes if they exist
-        if hasattr(self.parent, 'softmouse_colony') and isinstance(self.parent.softmouse_colony, wx.TextCtrl):
-            self.parent.softmouse_colony.SetValue(self.txt_colony.GetValue().strip())
-        if hasattr(self.parent, 'softmouse_fast') and isinstance(self.parent.softmouse_fast, wx.CheckBox):
-            self.parent.softmouse_fast.SetValue(self.chk_fast.GetValue())
-        if hasattr(self.parent, 'softmouse_headful') and isinstance(self.parent.softmouse_headful, wx.CheckBox):
-            self.parent.softmouse_headful.SetValue(self.chk_headful.GetValue())
-        # Store flags as attributes (future: persist to YAML)
+        # Store flags & values as attributes (persisted to YAML by parent.write_user_config)
+        self.parent._softmouse_last_colony = self.txt_colony.GetValue().strip()
+        self.parent._softmouse_fast_flag = self.chk_fast.GetValue()
+        self.parent._softmouse_headful_flag = self.chk_headful.GetValue()
         self.parent._softmouse_force_login = self.chk_force_login.GetValue()
         self.parent._softmouse_save_state = self.chk_save_state.GetValue()
         self.parent._softmouse_parse = self.chk_parse.GetValue()
+        if hasattr(self.parent, 'write_user_config'):
+            try:
+                self.parent.write_user_config()
+            except Exception:
+                pass
         if hasattr(self.parent, 'statusbar'):
             self.parent.statusbar.SetStatusText('SoftMouse config updated')
 
     def onTestLogin(self, event):  # noqa: D401
         self._persist_to_parent()
-        # Placeholder until login-only implemented in runner
-        if hasattr(self.parent, 'statusbar'):
-            colony = self.txt_colony.GetValue().strip()
-            if not colony:
+        colony = self.txt_colony.GetValue().strip()
+        if not colony:
+            if hasattr(self.parent, 'statusbar'):
                 self.parent.statusbar.SetStatusText('Enter colony name before test login')
-                return
-            self.parent.statusbar.SetStatusText('Test login triggered (full export until login-only added)')
+            return
+        # Launch login-only run via export_runner
+        try:
+            import multiprocessing as mp
+            from automation.export_runner import run_export
+        except Exception as e:
+            if hasattr(self.parent, 'statusbar'):
+                self.parent.statusbar.SetStatusText(f'Login test import error: {e}')
+            return
+        if getattr(self.parent, 'login_test_active', False):
+            if hasattr(self.parent, 'statusbar'):
+                self.parent.statusbar.SetStatusText('Login test already running')
+            return
+        q = mp.Queue()
+        fast = bool(getattr(self.parent, '_softmouse_fast_flag', False))
+        headful = bool(getattr(self.parent, '_softmouse_headful_flag', False))
+        force_login = bool(getattr(self.parent, '_softmouse_force_login', False))
+        save_state = bool(getattr(self.parent, '_softmouse_save_state', False))
+        proc = mp.Process(target=run_export, args=(
+            colony,
+            fast,
+            headful,
+            'softmouse_storage_state.json',
+            'downloads_animals',
+            q,
+            True,  # login_only
+            force_login,
+            save_state,
+        ), daemon=True)
+        try:
+            proc.start()
+        except Exception as e:
+            if hasattr(self.parent, 'statusbar'):
+                self.parent.statusbar.SetStatusText(f'Login test start error: {e}')
+            return
+        self.parent.login_test_active = True
+        self.parent.login_test_queue = q
+        self.parent.login_test_proc = proc
+        if not hasattr(self.parent, 'backgroundTimer'):
+            import wx as _wx
+            self.parent.backgroundTimer = _wx.Timer(self.parent)
+            self.parent.Bind(_wx.EVT_TIMER, self.parent.pollBackground, self.parent.backgroundTimer)
+        if not self.parent.backgroundTimer.IsRunning():
+            self.parent.backgroundTimer.Start(500)
+        if hasattr(self.parent, 'statusbar'):
+            self.parent.statusbar.SetStatusText('SoftMouse login test started...')
 
     def onRunExport(self, event):  # noqa: D401
         self._persist_to_parent()
@@ -165,14 +201,15 @@ class RFIDConfigDialog(wx.Dialog):
         self.btn_apply.Bind(wx.EVT_BUTTON, self.onApply)
 
     def onApply(self, event):  # noqa: D401
-        if hasattr(self.parent, 'rfid_port') and isinstance(self.parent.rfid_port, wx.TextCtrl):
-            self.parent.rfid_port.SetValue(self.txt_port.GetValue().strip())
-        if hasattr(self.parent, 'rfid_baud') and hasattr(self.parent.rfid_baud, 'SetValue'):
+        # Persist to parent attributes (even if legacy widgets removed)
+        self.parent._rfid_port_value = self.txt_port.GetValue().strip()
+        self.parent._rfid_baud_value = int(self.spin_baud.GetValue())
+        self.parent._rfid_autostart = self.chk_autostart.GetValue()
+        if hasattr(self.parent, 'write_user_config'):
             try:
-                self.parent.rfid_baud.SetValue(self.spin_baud.GetValue())
+                self.parent.write_user_config()
             except Exception:
                 pass
-        self.parent._rfid_autostart = self.chk_autostart.GetValue()
         if hasattr(self.parent, 'statusbar'):
             self.parent.statusbar.SetStatusText('RFID config applied')
 

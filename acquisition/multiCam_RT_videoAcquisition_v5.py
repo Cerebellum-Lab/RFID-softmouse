@@ -570,9 +570,48 @@ class MainFrame(wx.Frame):
     def write_user_config(self):
         usrdatadir = os.path.dirname(os.path.realpath(__file__))
         configname = os.path.join(usrdatadir, 'Users', self.user_drop.GetStringSelection() + '_userdata.yaml')
-        with open(configname, 'w') as cf:
-            ruamelFile = ruamel.yaml.YAML()
-            ruamelFile.dump(self.user_cfg, cf)
+        # Ensure base dict exists
+        if not hasattr(self, 'user_cfg') or not isinstance(self.user_cfg, dict):
+            self.user_cfg = {}
+        # Core legacy keys: ensure they exist to avoid KeyErrors elsewhere
+        defaults = {
+            'waitMin': 0,
+            'waitMax': 0,
+            'waitCt': 1,
+            'protocolSelected': 0,
+            'deliveryStyle': 0,
+            'waitAfterHand': 1.0,
+            'maxWait4Hand': 10.0,
+            'minTime2Eat': 2.0,
+            'maxTime2Eat': 30.0,
+        }
+        for k, v in defaults.items():
+            self.user_cfg.setdefault(k, v)
+        # Persist SoftMouse config section
+        sm = self.user_cfg.setdefault('softmouse', {})
+        sm['colony'] = getattr(self, '_softmouse_last_colony', sm.get('colony', '')) or ''
+        sm['fast'] = bool(getattr(self, '_softmouse_fast_flag', sm.get('fast', False)))
+        sm['headful'] = bool(getattr(self, '_softmouse_headful_flag', sm.get('headful', False)))
+        sm['force_login'] = bool(getattr(self, '_softmouse_force_login', sm.get('force_login', False)))
+        sm['save_state'] = bool(getattr(self, '_softmouse_save_state', sm.get('save_state', False)))
+        sm['parse'] = bool(getattr(self, '_softmouse_parse', sm.get('parse', False)))
+        # Persist RFID config section
+        rfid_cfg = self.user_cfg.setdefault('rfid', {})
+        rfid_cfg['port'] = getattr(self, '_rfid_port_value', rfid_cfg.get('port', '')) or ''
+        try:
+            rfid_cfg['baud'] = int(getattr(self, '_rfid_baud_value', rfid_cfg.get('baud', 9600)) or 9600)
+        except Exception:
+            rfid_cfg['baud'] = 9600
+        rfid_cfg['autostart'] = bool(getattr(self, '_rfid_autostart', rfid_cfg.get('autostart', False)))
+        try:
+            with open(configname, 'w') as cf:
+                ruamelFile = ruamel.yaml.YAML()
+                ruamelFile.dump(self.user_cfg, cf)
+        except Exception as e:
+            try:
+                self.log.error('Failed writing user config %s: %s', configname, e)
+            except Exception:
+                pass
             
     def addUser(self, event):
         dlg = wx.TextEntryDialog(self, 'Enter new user initials:', 'Add New User')
@@ -624,6 +663,33 @@ class MainFrame(wx.Frame):
         self.protocol.SetSelection(self.user_cfg['protocolSelected'])
         self.setProtocol(None)
         self.setDelStyle()
+        # ---- Load softmouse section into attributes ----
+        sm = self.user_cfg.get('softmouse') or {}
+        self._softmouse_last_colony = sm.get('colony', '') or ''
+        self._softmouse_fast_flag = bool(sm.get('fast', False))
+        self._softmouse_headful_flag = bool(sm.get('headful', False))
+        self._softmouse_force_login = bool(sm.get('force_login', False))
+        self._softmouse_save_state = bool(sm.get('save_state', False))
+        self._softmouse_parse = bool(sm.get('parse', True))
+        # ---- Load rfid section into attributes ----
+        rfid_cfg = self.user_cfg.get('rfid') or {}
+        self._rfid_port_value = rfid_cfg.get('port', '') or ''
+        try:
+            self._rfid_baud_value = int(rfid_cfg.get('baud', 9600) or 9600)
+        except Exception:
+            self._rfid_baud_value = 9600
+        self._rfid_autostart = bool(rfid_cfg.get('autostart', False))
+        # Mirror to legacy widgets if present
+        try:
+            if hasattr(self, 'rfid_port') and isinstance(self.rfid_port, wx.TextCtrl) and self._rfid_port_value:
+                self.rfid_port.SetValue(self._rfid_port_value)
+            if hasattr(self, 'rfid_baud'):
+                try:
+                    self.rfid_baud.SetValue(str(self._rfid_baud_value))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def lookupRFID(self, event):
         """Lookup RFID from in-memory animals export only (no external service)."""
@@ -1293,7 +1359,6 @@ class MainFrame(wx.Frame):
                 self.camaq.value = 1
                 self.startAq()
                 self.liveTimer.Start(150)
-                self.play.SetLabel('Stop')
             self.rec.Enable(False)
             for h in self.disable4cam:
                 h.Enable(False)
@@ -1303,6 +1368,19 @@ class MainFrame(wx.Frame):
             self.stopAq()
             time.sleep(2)
             self.play.SetLabel('Live')
+        if self._rfid_autostart and hasattr(self, 'animal_metadata') and not getattr(self, 'rfid_listening', False):
+            try:
+                # Mirror to legacy widgets if present
+                if hasattr(self, 'rfid_port') and isinstance(self.rfid_port, wx.TextCtrl):
+                    self.rfid_port.SetValue(self._rfid_port_value)
+                if hasattr(self, 'rfid_baud'):
+                    try:
+                        self.rfid_baud.SetValue(str(self._rfid_baud_value))
+                    except Exception:
+                        pass
+                self._start_rfid_listener()
+            except Exception:
+                pass
             self.rec.Enable(True)
             for h in self.disable4cam:
                 h.Enable(True)

@@ -36,16 +36,16 @@ class SoftMouseConfigDialog(wx.Dialog):
         grid.Add(self.chk_headful)
 
         # Force login, Save state, Parse
-    self.chk_force_login = wx.CheckBox(pnl, label='Force fresh login')
+        self.chk_force_login = wx.CheckBox(pnl, label='Force fresh login')
         grid.Add(self.chk_force_login, 0, wx.ALIGN_LEFT)
-    self.chk_save_state = wx.CheckBox(pnl, label='Save state after login')
+        self.chk_save_state = wx.CheckBox(pnl, label='Save state after login')
         grid.Add(self.chk_save_state, 0, wx.ALIGN_LEFT)
-    self.chk_parse = wx.CheckBox(pnl, label='Parse exported file')
+        self.chk_parse = wx.CheckBox(pnl, label='Parse exported file')
         grid.Add(self.chk_parse, 0, wx.ALIGN_LEFT)
-    # Initialize flag checkboxes from parent attributes if present
-    self.chk_force_login.SetValue(bool(getattr(parent, '_softmouse_force_login', False)))
-    self.chk_save_state.SetValue(bool(getattr(parent, '_softmouse_save_state', False)))
-    self.chk_parse.SetValue(bool(getattr(parent, '_softmouse_parse', True)))
+        # Initialize flag checkboxes from parent attributes if present
+        self.chk_force_login.SetValue(bool(getattr(parent, '_softmouse_force_login', False)))
+        self.chk_save_state.SetValue(bool(getattr(parent, '_softmouse_save_state', False)))
+        self.chk_parse.SetValue(bool(getattr(parent, '_softmouse_parse', True)))
 
         # Spacer
         grid.Add((5, 5))

@@ -39,6 +39,7 @@ EXPORT_BUTTON_SELECTOR = "#exportMouseMenuButton"
 EXPORTS_TAB_SELECTOR = "a:has-text('Exports'), a[href*='export/history' i]"
 EXPORTS_TABLE_ROWS = "table tr"
 POST_LOGIN_JS_CHECK = 'typeof ISH !== "undefined" && ISH.appContext && ISH.appContext.accessUserId > 0'
+EXPORT_LOG_LINK_SELECTOR = "a:has-text('Export Log'), a:has-text('Export log')"
 
 LOGIN_FORM_SELECTOR = 'form[name="loginForm"], form[action*="login.do" i]'
 LOGIN_SELECTORS = {
@@ -210,15 +211,103 @@ async def export_animals(args):
                 log.info('Saved new storage state to %s', args.state_file)
         t_colony = _now(); await _find_and_click_colony(page, args.colony_name); log.info('[TIMER] colony nav complete (%s)', _fmt_dur(t_colony))
         t_animals = _now(); await _goto_animals(page); log.info('[TIMER] animals page reached (%s)', _fmt_dur(t_animals))
-        t_export_click = _now();
+        # --- Download phase ---
+        # Original implementation attached a context.on('download') listener AFTER clicking, which can
+        # miss downloads that begin synchronously (the event fires before handler registration).
+        # We now first attempt Playwright's expect_download context manager (registers listener before click).
+        t_export_click = _now(); export_start_wall = time.time()
+        # Network response fallback container
+        response_capture: dict[str, pathlib.Path | bytes | None] = {'path': None, 'body': None}
+
+        async def _capture_response(resp):  # executed in task when potential export response detected
+            try:
+                body = await resp.body()
+            except Exception:
+                return
+            if not body:
+                return
+            # Derive filename
+            headers = {k.lower(): v for k,v in resp.headers.items()}
+            dispo = headers.get('content-disposition','')
+            suggested = None
+            if 'filename=' in dispo:
+                suggested = dispo.split('filename=')[-1].strip().strip('"').split(';')[0]
+            if not suggested:
+                # Guess extension from content-type
+                ctype = headers.get('content-type','')
+                if 'sheet' in ctype: suggested = 'softmouse_export.xlsx'
+                elif 'excel' in ctype: suggested = 'softmouse_export.xls'
+                else: suggested = 'softmouse_export.bin'
+            target = pathlib.Path(tempfile.gettempdir())/suggested
+            try:
+                with open(target,'wb') as fh: fh.write(body)
+                response_capture['path'] = target
+                response_capture['body'] = body
+                log.info('Captured export via response fallback -> %s (%d bytes)', target.name, len(body))
+            except Exception as e:
+                log.warning('Failed writing response fallback file: %s', e)
+
+        def _response_listener(resp):
+            try:
+                if response_capture['path'] is not None:
+                    return
+                headers = {k.lower(): v for k,v in resp.headers.items()}
+                ctype = headers.get('content-type','').lower()
+                dispo = headers.get('content-disposition','').lower()
+                url_l = resp.url.lower()
+                if args.debug_network:
+                    log.info('[NET] %s | %s | dispo=%s', resp.url, ctype or '(none)', dispo or '(none)')
+                trigger = (
+                    'attachment' in dispo or
+                    'application/vnd.ms-excel' in ctype or
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' in ctype or
+                    'application/octet-stream' in ctype and 'taskid=' in url_l or
+                    ('downloadfile' in url_l) or ('taskid=' in url_l and 'export' in url_l)
+                )
+                if trigger:
+                    asyncio.create_task(_capture_response(resp))
+            except Exception:
+                pass
+
+        context.on('response', _response_listener)
+        path_final: pathlib.Path | None = None
+        expect_timeout_ms = int(args.download_wait * 1000)
         try:
-            await page.click(EXPORT_BUTTON_SELECTOR)
-            log.info('Clicked export button; waiting up to %ds for native download to appear in browser download dir.', int(args.download_wait))
+            log.info('Initiating export (context-level expect_event within %ds)...', int(args.download_wait))
+            async with context.expect_event('download', timeout=expect_timeout_ms) as dl_info:
+                await page.click(EXPORT_BUTTON_SELECTOR)
+            download = await dl_info.value
+            path_final = await _materialize_download(download)
+            log.info('[TIMER] export click+download (context) done (%s)', _fmt_dur(t_export_click))
         except Exception as e:
-            raise ExportError(f'Failed to click export button: {e}')
-        log.info('[TIMER] export click done (%s)', _fmt_dur(t_export_click))
-        t_wait = _now(); path_final = await _wait_for_native_download(context, args); log.info('[TIMER] download complete (%s)', _fmt_dur(t_wait))
-        if not path_final: raise ExportError('No download detected within wait window.')
+            log.warning('Primary context download wait failed (%s); falling back to event listener + polling: %s', type(e).__name__, e)
+            # Fallback: click again only if needed then use legacy listener approach
+            if not path_final:
+                try:
+                    if await _selector_exists(page, EXPORT_BUTTON_SELECTOR):
+                        await page.click(EXPORT_BUTTON_SELECTOR)
+                except Exception:
+                    pass
+            t_wait = _now(); path_final = await _wait_for_native_download(context, args); log.info('[TIMER] download complete (fallback listener) (%s)', _fmt_dur(t_wait))
+        if not path_final and response_capture['path']:
+            path_final = response_capture['path']  # type: ignore[assignment]
+        # Attempt Export Log workflow if still nothing (site may now queue export and require manual retrieval)
+        if not path_final:
+            t_log = _now();
+            try:
+                path_final = await _attempt_export_log_workflow(context, page, args, export_start_wall)
+                if path_final:
+                    log.info('[TIMER] export log retrieval complete (%s)', _fmt_dur(t_log))
+            except Exception as e:
+                log.warning('Export log workflow failed: %s', e)
+        if not path_final:
+            # Final fallback: poll OS download directory (user-provided or heuristic) for newest .xls/.xlsx file since export click.
+            t_os = _now();
+            path_final = _scan_os_downloads(args, export_start_wall)
+            if path_final:
+                log.info('[TIMER] download detected via OS fallback (%s)', _fmt_dur(t_os))
+        if not path_final:
+            raise ExportError('No download detected within wait window (expect, listener, and OS scan failed).')
         if args.download_dir:
             os.makedirs(args.download_dir, exist_ok=True)
             dest = pathlib.Path(args.download_dir)/path_final.name
@@ -287,6 +376,155 @@ async def _wait_for_native_download(context, args) -> pathlib.Path | None:
     if event_error: log.warning('Download event error encountered: %s', event_error)
     return None
 
+async def _materialize_download(download) -> pathlib.Path:
+    """Given a Playwright Download object, persist it to a deterministic temp file and return the path.
+
+    The .path() may return None if the artifact is not yet finalized; in that case we explicitly save it.
+    """
+    try:
+        tmp_path = await download.path()
+    except Exception:
+        tmp_path = None
+    suggested = getattr(download, 'suggested_filename', None) or 'softmouse_export'
+    if tmp_path:
+        return pathlib.Path(tmp_path)
+    # Manual save
+    target = pathlib.Path(tempfile.gettempdir()) / suggested
+    try:
+        await download.save_as(str(target))
+    except Exception as e:
+        raise ExportError(f'Failed saving download: {e}')
+    return target
+
+def _scan_os_downloads(args, export_start_wall: float) -> pathlib.Path | None:
+    """Heuristic scan of OS download directory for a recent SoftMouse export file.
+
+    SoftMouse exports are typically .xls, .xlsx, or .csv and appear with 'mouse' or 'export' in name.
+    We look for newest matching file within the provided wait window horizon (download-wait * 1.5 seconds).
+    """
+    # Determine candidate directory
+    user_dir = os.path.expandvars(os.path.expanduser(args.os_download_dir)) if args.os_download_dir else None
+    candidates: list[pathlib.Path] = []
+    if user_dir and os.path.isdir(user_dir):
+        candidates.append(pathlib.Path(user_dir))
+    # Common Windows / cross-platform default
+    home = pathlib.Path.home()
+    default_dl = home / 'Downloads'
+    if default_dl.is_dir() and default_dl not in candidates:
+        candidates.append(default_dl)
+    if not candidates:
+        log.debug('OS fallback: no candidate download directories found.')
+        return None
+    # Only consider files modified after export_start_wall - 2s (grace period)
+    horizon = export_start_wall - 2.0
+    # Relax name pattern: Many browsers assign GUID-like names first, so rely on extension + mtime only.
+    patterns = None
+    newest: tuple[float, pathlib.Path] | None = None
+    for base in candidates:
+        try:
+            for f in base.iterdir():
+                if not f.is_file():
+                    continue
+                if f.suffix.lower() not in ('.xls', '.xlsx', '.csv'):
+                    continue
+                try:
+                    st = f.stat()
+                except Exception:
+                    continue
+                if st.st_mtime < horizon:
+                    continue
+                if patterns and not patterns.search(f.name):
+                    continue
+                if newest is None or st.st_mtime > newest[0]:
+                    newest = (st.st_mtime, f)
+        except Exception as e:
+            log.debug('OS fallback scan failed for %s: %s', base, e)
+    if newest:
+        log.info('OS fallback selected candidate file: %s', newest[1])
+        return newest[1]
+    log.info('OS fallback found no matching recent files.')
+    return None
+
+def _guess_extension(body: bytes, ctype: str, url: str) -> str:
+    try:
+        if body.startswith(b'PK\x03\x04'): return '.xlsx'
+        if body.startswith(b'\xD0\xCF\x11\xE0'): return '.xls'
+        # Text-like heuristic
+        sample = body[:200]
+        if sample and all((32 <= b <= 126) or b in (9,10,13) for b in sample):
+            if b',' in sample or b'\t' in sample: return '.csv'
+    except Exception:
+        pass
+    ctype_l = (ctype or '').lower()
+    if 'sheet' in ctype_l: return '.xlsx'
+    if 'excel' in ctype_l: return '.xls'
+    if any(p in url.lower() for p in ('xlsx','sheet','excel')): return '.xlsx'
+    return '.bin'
+
+async def _attempt_export_log_workflow(context, page, args, export_start_wall: float) -> pathlib.Path | None:
+    """Navigate to Export Log page and attempt to download the most recent export entry.
+
+    Strategy:
+      1. Look for direct link with text 'Export Log'. If not present, try adding '/export/history' variations.
+      2. On history page, identify first table row containing .xls/.xlsx hyperlink.
+      3. Intercept response for that hyperlink similar to network fallback.
+    """
+    try:
+        # Step 1: navigate to log page
+        log.info('Attempting Export Log fallback workflow...')
+        try:
+            if await page.query_selector(EXPORT_LOG_LINK_SELECTOR):
+                await page.click(EXPORT_LOG_LINK_SELECTOR)
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+        # If still on animals page, attempt manual URL
+        if 'export' not in page.url.lower():
+            base = page.url.split('/smdb/')[0]
+            candidates = [
+                base + '/smdb/export/history.do',
+                base + '/smdb/mouse/export/history.do',
+            ]
+            for u in candidates:
+                try:
+                    await page.goto(u, wait_until='load')
+                    if 'export' in page.url.lower(): break
+                except Exception:
+                    continue
+        # Scan for table rows with links
+        rows = await page.query_selector_all('table tr')
+        best_link = None; best_time = None
+        for r in rows:
+            try:
+                link = await r.query_selector('a[href*=".xls" i], a[href*=".xlsx" i]')
+                if not link: continue
+                href = await link.get_attribute('href')
+                if not href: continue
+                # Prefer first match (assuming descending order)
+                best_link = link; break
+            except Exception:
+                continue
+        if not best_link:
+            return None
+        # Use expect_download again as log workflow might trigger standard download
+        try:
+            async with page.expect_download(timeout=int(args.download_wait*1000/2)) as dlinfo:
+                await best_link.click()
+            dl = await dlinfo.value
+            return await _materialize_download(dl)
+        except Exception:
+            # Fall back to network capture of link navigation
+            try:
+                await best_link.click()
+                await asyncio.sleep(4)
+            except Exception:
+                return None
+            # Try scanning OS downloads quickly
+            return _scan_os_downloads(args, export_start_wall)
+    except Exception as e:
+        log.debug('Export log workflow internal error: %s', e)
+    return None
+
 async def _parse_to_dataframe(path: pathlib.Path):
     if pd is None: raise ExportError('pandas not installed; cannot parse export.')
     suffix = path.suffix.lower()
@@ -345,6 +583,8 @@ def parse_cli(argv=None):
     ap.add_argument('--export-log-dir', default='export_logs', help='Directory for trace logs (legacy)')
     ap.add_argument('--use-exports-tab', action='store_true', help='Force old Exports history workflow (fallback mode)')
     ap.add_argument('--no-archive', action='store_true', help='Do not archive prior exports')
+    ap.add_argument('--os-download-dir', help='Absolute path to system/OS download directory to poll as last-resort (e.g. %USERPROFILE%/Downloads)')
+    ap.add_argument('--debug-network', action='store_true', help='Log network responses during export window for troubleshooting')
     return ap.parse_args(argv)
 
 def main(argv=None):

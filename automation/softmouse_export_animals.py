@@ -4,7 +4,21 @@
 from __future__ import annotations
 import asyncio, argparse, os, sys, re, tempfile, shutil, time, pathlib, getpass, datetime, mimetypes, json, struct, math, hashlib
 from typing import Optional, Tuple
-from app_logging import get_logger
+
+# --- Restructuring compatibility bootstrap ---
+# Ensure repository root (parent of this automation/ folder) is on sys.path so we can import root modules
+# like app_logging when this script is executed directly (Python sets sys.path[0] to the script directory only).
+try:
+    _SCRIPT_PARENT = pathlib.Path(__file__).resolve().parent.parent
+    if str(_SCRIPT_PARENT) not in sys.path:
+        sys.path.insert(0, str(_SCRIPT_PARENT))
+except Exception:
+    pass
+
+try:
+    from app_logging import get_logger  # type: ignore
+except ModuleNotFoundError as e:  # pragma: no cover - defensive
+    raise ModuleNotFoundError("Failed to import app_logging after path bootstrap; ensure repository root structure is intact.") from e
 
 log = get_logger('softmouse.export')
 

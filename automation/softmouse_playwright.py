@@ -1,7 +1,17 @@
 """SoftMouse automation helper (login + future actions) (moved to automation/ folder)."""
 from __future__ import annotations
-import os, asyncio, argparse, getpass, sys, time, hashlib
+import os, asyncio, argparse, getpass, sys, time, hashlib, pathlib
 from typing import Tuple
+
+# --- Restructuring compatibility bootstrap ---
+# Add repository root to sys.path so imports of modules that lived at project root still work
+try:
+	_SCRIPT_PARENT = pathlib.Path(__file__).resolve().parent.parent
+	if str(_SCRIPT_PARENT) not in sys.path:
+		sys.path.insert(0, str(_SCRIPT_PARENT))
+except Exception:
+	pass
+
 from app_logging import get_logger
 
 try:

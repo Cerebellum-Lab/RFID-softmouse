@@ -343,7 +343,42 @@ class MainFrame(wx.Frame):
         wSpacer.Add(self.rfid_lookup, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
         self.rfid_lookup.Bind(wx.EVT_BUTTON, self.lookupRFID)
         vpos+=1
-            
+
+        # SoftMouse export controls (animals metadata)
+        sm_box_label = wx.StaticText(self.widget_panel, label='SoftMouse Colony:')
+        wSpacer.Add(sm_box_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.softmouse_colony = wx.TextCtrl(self.widget_panel, id=wx.ID_ANY, value="")
+        wSpacer.Add(self.softmouse_colony, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
+        self.softmouse_load_btn = wx.Button(self.widget_panel, id=wx.ID_ANY, label="Load Animals")
+        wSpacer.Add(self.softmouse_load_btn, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.softmouse_load_btn.Bind(wx.EVT_BUTTON, self.startAnimalExport)
+        vpos+=1
+        self.softmouse_fast = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Fast")
+        wSpacer.Add(self.softmouse_fast, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.softmouse_headful = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Headful")
+        wSpacer.Add(self.softmouse_headful, pos=(vpos,1), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.softmouse_status = wx.StaticText(self.widget_panel, label='Animals: none loaded')
+        wSpacer.Add(self.softmouse_status, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        vpos+=1
+
+        # RFID auto listener controls
+        rfid_listen_label = wx.StaticText(self.widget_panel, label='RFID Port:')
+        wSpacer.Add(rfid_listen_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.rfid_port = wx.TextCtrl(self.widget_panel, id=wx.ID_ANY, value="COM3")
+        wSpacer.Add(self.rfid_port, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
+        self.rfid_toggle = wx.ToggleButton(self.widget_panel, id=wx.ID_ANY, label='RFID Listen')
+        wSpacer.Add(self.rfid_toggle, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.rfid_toggle.Bind(wx.EVT_TOGGLEBUTTON, self.toggleRFIDListener)
+        vpos+=1
+        baud_label = wx.StaticText(self.widget_panel, label='Baud:')
+        wSpacer.Add(baud_label, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.rfid_baud = wx.SpinCtrl(self.widget_panel, value='9600', size=(70,-1))
+        self.rfid_baud.SetRange(1200, 115200)
+        wSpacer.Add(self.rfid_baud, pos=(vpos,1), span=(0,1), flag=wx.ALL, border=wSpace)
+        self.rfid_status = wx.StaticText(self.widget_panel, label='RFID idle')
+        wSpacer.Add(self.rfid_status, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        vpos+=1
+
         start_text = wx.StaticText(self.widget_panel, label='Stim on:')
         wSpacer.Add(start_text, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
         protocol_list = ['First Reach','Pellet Arrival','Pellet Reveal']
@@ -568,32 +603,35 @@ class MainFrame(wx.Frame):
         self.setDelStyle()
 
     def lookupRFID(self, event):
-        """Lookup RFID via FastAPI service (requests) with DB fallback."""
-        tag = self.rfid_input.GetValue().strip()
+        """Lookup RFID from in-memory animals export only (no external service)."""
+        tag_raw = self.rfid_input.GetValue().strip()
+        tag = ''.join(c for c in tag_raw if c.isalnum())
         if not tag:
-            self.statusbar.SetStatusText("No RFID entered")
-            self.log.warning('Lookup attempt with empty RFID input')
+            self.statusbar.SetStatusText('No RFID entered')
+            self.log.warning('Lookup attempt with empty / non-alphanumeric RFID input raw=%r', tag_raw)
             return
-        try:
-            import rfid_lookup
-            rec = rfid_lookup.fetch_mouse(tag)
-            if rec:
-                previous_rfid = self.mouse_meta.get('rfid') if getattr(self, 'mouse_meta', None) else None
-                self.mouse_meta = rec
-                # Ensure active_rfid tracks current
-                self.active_rfid = rec.get('rfid') or tag
-                if previous_rfid and previous_rfid != self.active_rfid:
-                    self.log.info('RFID replaced old=%s new=%s', previous_rfid, self.active_rfid)
-                src = 'HTTP' if 'source' in rec else 'local'
-                self.statusbar.SetStatusText(f"RFID {tag} loaded ({src})")
-                self.log.info('RFID %s loaded source=%s', tag, src)
-            else:
-                self.mouse_meta = dict()
-                self.statusbar.SetStatusText(f"RFID {tag} not found")
-                self.log.info('RFID %s not found', tag)
-        except Exception as e:
-            self.statusbar.SetStatusText(f"RFID error: {e}")
-            self.log.exception('RFID lookup error for %s: %s', tag, e)
+        if not hasattr(self, 'animal_metadata'):
+            self.statusbar.SetStatusText('Animals metadata not loaded')
+            self.log.warning('RFID lookup attempted without animals metadata loaded')
+            return
+        df = self.animal_metadata
+        match_row = None
+        for col in df.columns:
+            if 'rfid' in col.lower() or 'tag' in col.lower():
+                subset = df[df[col].astype(str)==tag]
+                if len(subset) == 1:
+                    match_row = subset.iloc[0]
+                    break
+        if match_row is not None:
+            self.mouse_meta = match_row.to_dict()
+            self.mouse_meta['rfid'] = tag
+            self.active_rfid = tag
+            name = self.mouse_meta.get('Name') or self.mouse_meta.get('name') or '(unnamed)'
+            self.statusbar.SetStatusText(f'RFID {tag} matched {name}')
+            self.log.info('RFID lookup matched tag=%s name=%s', tag, name)
+        else:
+            self.statusbar.SetStatusText(f'RFID {tag} not found in current table')
+            self.log.info('RFID %s not found in animals metadata', tag)
 
     def write_metalink_entry(self):
         """Append a metalink entry linking RFID/mouse metadata to this session.
@@ -622,6 +660,209 @@ class MainFrame(wx.Frame):
         with metalink_path.open('a', encoding='utf-8') as fh:
             fh.write(json.dumps(entry) + '\n')
         self.log.info('Metalink appended rfid=%s session=%s', rfid, sess_name)
+
+    # ---------------- SoftMouse animals metadata export (background) -----------------
+    def startAnimalExport(self, event):
+        if getattr(self, 'animal_export_active', False):
+            self.log.warning('Animal export already running')
+            return
+        colony = self.softmouse_colony.GetValue().strip()
+        if not colony:
+            self.statusbar.SetStatusText('Enter colony name for SoftMouse export')
+            return
+        try:
+            import multiprocessing as mp
+            from automation.export_runner import run_export
+        except Exception as e:
+            self.statusbar.SetStatusText(f'Export module error: {e}')
+            self.log.exception('Failed importing export runner: %s', e)
+            return
+        self.animal_export_queue = mp.Queue()
+        self.animal_export_proc = mp.Process(target=run_export, args=(
+            colony,
+            bool(self.softmouse_fast.GetValue()),
+            bool(self.softmouse_headful.GetValue()),
+            'softmouse_storage_state.json',
+            'downloads_animals',
+            self.animal_export_queue,
+        ), daemon=True)
+        self.animal_export_proc.start()
+        self.animal_export_active = True
+        self.softmouse_status.SetLabel('Animals: loading...')
+        self.statusbar.SetStatusText('SoftMouse export started')
+        if not hasattr(self, 'backgroundTimer'):
+            self.backgroundTimer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self.pollBackground, self.backgroundTimer)
+        if not self.backgroundTimer.IsRunning():
+            self.backgroundTimer.Start(500)
+
+    def pollBackground(self, event):
+        # Called by backgroundTimer to poll child processes/queues
+        updated = False
+        # Animal export results
+        if getattr(self, 'animal_export_active', False):
+            try:
+                if self.animal_export_queue.qsize() > 0:
+                    res = self.animal_export_queue.get_nowait()
+                else:
+                    res = None
+            except Exception:
+                res = None
+            if res is not None:
+                self.animal_export_active = False
+                try:
+                    if self.animal_export_proc.is_alive():
+                        self.animal_export_proc.join(timeout=0.2)
+                except Exception:
+                    pass
+                if res.get('ok') and res.get('file'):
+                    self._load_animals_file(res['file'])
+                else:
+                    err = res.get('error', 'unknown error')
+                    self.softmouse_status.SetLabel('Animals: failed')
+                    self.statusbar.SetStatusText(f'Export failed: {err}')
+                    self.log.error('SoftMouse export failed: %s', err)
+                updated = True
+        if updated:
+            self.figure.canvas.draw_idle()
+        # If nothing left to poll, stop timer
+        # RFID events
+        if getattr(self, 'rfid_listening', False):
+            try:
+                while self.rfid_queue.qsize() > 0:
+                    evt = self.rfid_queue.get_nowait()
+                    if 'error' in evt:
+                        self.rfid_status.SetLabel(f"RFID error: {evt['error']}")
+                        self.statusbar.SetStatusText(f"RFID error: {evt['error']}")
+                        self.log.error('RFID listener error: %s', evt['error'])
+                        self._stop_rfid_listener()
+                        break
+                    tag = evt.get('tag')
+                    if tag:
+                        self._handle_rfid_tag(tag)
+            except Exception:
+                pass
+        if not getattr(self, 'animal_export_active', False) and not getattr(self, 'rfid_listening', False):
+            try:
+                if self.backgroundTimer.IsRunning():
+                    self.backgroundTimer.Stop()
+            except Exception:
+                pass
+
+    def _load_animals_file(self, path):
+        from pathlib import Path
+        import pandas as pd
+        try:
+            p = Path(path)
+            if p.suffix.lower() == '.csv':
+                df = pd.read_csv(p)
+            else:
+                df = pd.read_excel(p)
+            self.animal_metadata = df
+            self.softmouse_status.SetLabel(f'Animals: {len(df)} rows')
+            self.statusbar.SetStatusText(f'Loaded animals metadata ({len(df)} rows)')
+            self.log.info('Animals metadata loaded rows=%d', len(df))
+        except Exception as e:
+            self.softmouse_status.SetLabel('Animals: parse error')
+            self.statusbar.SetStatusText(f'Animals parse error: {e}')
+            self.log.exception('Failed parsing animals file: %s', e)
+
+    # ---------------- RFID listener integration -----------------
+    def toggleRFIDListener(self, event):
+        if self.rfid_toggle.GetValue():
+            self._start_rfid_listener()
+        else:
+            self._stop_rfid_listener()
+
+    def _start_rfid_listener(self):
+        if getattr(self, 'rfid_listening', False):
+            return
+        if not hasattr(self, 'animal_metadata'):
+            self.statusbar.SetStatusText('Load animals before starting RFID listener')
+            self.rfid_toggle.SetValue(False)
+            return
+        try:
+            import multiprocessing as mp
+            from rfid.rfid_listener_process import run_rfid_listener
+        except Exception as e:
+            self.statusbar.SetStatusText(f'RFID module import error: {e}')
+            self.rfid_toggle.SetValue(False)
+            return
+        port = self.rfid_port.GetValue().strip()
+        baud = int(self.rfid_baud.GetValue())
+        if not port:
+            self.statusbar.SetStatusText('Enter COM port for RFID')
+            self.rfid_toggle.SetValue(False)
+            return
+        self.rfid_queue = mp.Queue()
+        self.rfid_stop = mp.Event()
+        self.rfid_proc = mp.Process(target=run_rfid_listener, args=(port, baud, self.rfid_queue, self.rfid_stop), daemon=True)
+        try:
+            self.rfid_proc.start()
+        except Exception as e:
+            self.statusbar.SetStatusText(f'RFID start error: {e}')
+            self.rfid_toggle.SetValue(False)
+            return
+        self.rfid_listening = True
+        self.rfid_status.SetLabel('RFID listening...')
+        if not hasattr(self, 'backgroundTimer'):
+            self.backgroundTimer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self.pollBackground, self.backgroundTimer)
+        if not self.backgroundTimer.IsRunning():
+            self.backgroundTimer.Start(500)
+        self.statusbar.SetStatusText('RFID listener started')
+        self.log.info('RFID listener started port=%s baud=%s', port, baud)
+
+    def _stop_rfid_listener(self):
+        if not getattr(self, 'rfid_listening', False):
+            return
+        try:
+            self.rfid_stop.set()
+        except Exception:
+            pass
+        try:
+            if self.rfid_proc.is_alive():
+                self.rfid_proc.join(timeout=1.0)
+        except Exception:
+            pass
+        self.rfid_listening = False
+        self.rfid_status.SetLabel('RFID idle')
+        self.rfid_toggle.SetValue(False)
+        self.statusbar.SetStatusText('RFID listener stopped')
+        self.log.info('RFID listener stopped')
+
+    def _handle_rfid_tag(self, tag: str):
+        # Sanitize and enforce alphanumeric tag
+        raw = tag
+        tag = ''.join(ch for ch in tag if ch.isalnum())
+        if not tag or not tag.isalnum():
+            self.log.warning('Discarding non-alphanumeric RFID input raw=%r sanitized=%r', raw, tag)
+            return
+        # Lookup tag within loaded animals metadata if present
+        import pandas as pd
+        name = None
+        if hasattr(self, 'animal_metadata'):
+            df = self.animal_metadata
+            for col in df.columns:
+                if 'rfid' in col.lower() or 'tag' in col.lower():
+                    matches = df[df[col].astype(str)==tag]
+                    if len(matches) == 1:
+                        # capture row as dict
+                        self.mouse_meta = matches.iloc[0].to_dict()
+                        self.mouse_meta['rfid'] = tag
+                        name = self.mouse_meta.get('Name') or self.mouse_meta.get('name')
+                        break
+        msg = f'RFID tag {tag}' + (f' matched {name}' if name else ' (no match)')
+        self.rfid_status.SetLabel(msg[:30])
+        self.statusbar.SetStatusText(msg)
+        self.log.info('RFID tag read tag=%s match=%s', tag, bool(name))
+        if name:
+            dlg = wx.MessageDialog(parent=None, message=f'RFID {tag} matched {name}. Use this mouse?', caption='RFID Match', style=wx.YES_NO|wx.ICON_INFORMATION)
+            if dlg.ShowModal() == wx.ID_YES:
+                self.log.info('RFID %s accepted by user', tag)
+            else:
+                self.log.info('RFID %s rejected by user', tag)
+            dlg.Destroy()
         
     def setProtocol(self, event):
         self.proto_str = self.protocol.GetStringSelection()
@@ -1621,6 +1862,18 @@ class MainFrame(wx.Frame):
         Quits the GUI
         """
         print('Close event called')
+        # Stop background processes we introduced
+        try:
+            if getattr(self, 'rfid_listening', False):
+                self._stop_rfid_listener()
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'animal_export_active', False):
+                if self.animal_export_proc.is_alive():
+                    self.animal_export_proc.terminate()
+        except Exception:
+            pass
         if self.play.GetValue():
             self.play.SetValue(False)
             self.liveFeed(event)

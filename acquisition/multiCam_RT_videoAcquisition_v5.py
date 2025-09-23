@@ -1556,6 +1556,22 @@ class MainFrame(wx.Frame):
         
     def recordCam(self, event):
         if self.rec.GetValue():
+            # --- Pre-record dialog (only if RFID present) ---
+            try:
+                if getattr(self, 'mouse_meta', None) and not getattr(self, '_prerecord_context', None):
+                    dlg = PreRecordDialog(self)
+                    if dlg.ShowModal() == wx.ID_OK:
+                        self._prerecord_context = dlg.get_values()
+                    else:
+                        dlg.Destroy()
+                        self.rec.SetValue(False)
+                        return
+                    dlg.Destroy()
+            except Exception as _e:
+                try:
+                    self.log.error('PreRecord dialog failed: %s', _e)
+                except Exception:
+                    pass
             self.compress_vid.Enable(False)
             self.system_cfg = clara.read_config()
             liveRate = 250
@@ -1696,6 +1712,59 @@ class MainFrame(wx.Frame):
                     print(f'Failed to attach mouse metadata: {e}')
             clara.write_metadata(self.meta, self.metapath)
             self.log.info('Recording stopped session_dir=%s metadata_written=%s', self.sess_dir, self.metapath)
+            # --- Post-record dialog ---
+            post_context = None
+            try:
+                dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
+                if dlg2.ShowModal() == wx.ID_OK:
+                    post_context = dlg2.get_values()
+                dlg2.Destroy()
+            except Exception as _e:
+                try:
+                    self.log.error('PostRecord dialog failed: %s', _e)
+                except Exception:
+                    pass
+            # Save combined metadata (JSON) in session dir
+            try:
+                import json, datetime as _dt, pathlib as _pl
+                if hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
+                    merged = {
+                        'timestamp': _dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                        'rfid': getattr(self.mouse_meta, 'rfid', None) if isinstance(getattr(self, 'mouse_meta', None), dict) else (self.mouse_meta.get('rfid') if getattr(self, 'mouse_meta', None) else None),
+                        'animal_meta': getattr(self, 'mouse_meta', None),
+                        'prerecord': getattr(self, '_prerecord_context', None),
+                        'postrecord': post_context,
+                        'duration_seconds': self.meta.get('duration (s)'),
+                        'stim_protocol': getattr(self, 'proto_str', None),
+                    }
+                    jf = _pl.Path(self.sess_dir) / 'session_notes.json'
+                    with jf.open('w', encoding='utf-8') as fh:
+                        json.dump(merged, fh, indent=2)
+            except Exception as _e:
+                try:
+                    self.log.error('Failed writing session_notes.json: %s', _e)
+                except Exception:
+                    pass
+            # Prompt for new subject if RFID present
+            try:
+                if getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
+                    q = wx.MessageDialog(self, 'Will you switch to a new subject next?', 'New Subject?', style=wx.YES_NO|wx.ICON_QUESTION)
+                    if q.ShowModal() == wx.ID_YES:
+                        # Clear RFID state
+                        try:
+                            self.mouse_meta = None
+                            self.active_rfid = None
+                            if hasattr(self, 'rfid_input'):
+                                self.rfid_input.SetValue('')
+                            self.statusbar.SetStatusText('RFID cleared for next subject')
+                        except Exception:
+                            pass
+                    q.Destroy()
+                # Reset prerecord context regardless
+                if hasattr(self, '_prerecord_context'):
+                    delattr(self, '_prerecord_context')
+            except Exception:
+                pass
             if self.recTimer.IsRunning():
                 self.recTimer.Stop()
             self.stopAq()
@@ -2026,3 +2095,79 @@ def show():
 if __name__ == '__main__':
     
     show()
+
+# ---------------- New Dialog Classes (Pre/Post Recording) -----------------
+
+class PreRecordDialog(wx.Dialog):
+    """Collect pre-recording context (recording type, modality, task, notes)."""
+    def __init__(self, parent):
+        super().__init__(parent, title='Pre-Recording Details', style=wx.DEFAULT_DIALOG_STYLE|wx.RESIZE_BORDER)
+        pnl = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        grid = wx.FlexGridSizer(0, 2, 6, 8)
+        grid.Add(wx.StaticText(pnl, label='Recording Type:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.choice_record_type = wx.Choice(pnl, choices=['Behavior', 'Imaging', 'Calibration', 'Other'])
+        self.choice_record_type.SetSelection(0)
+        grid.Add(self.choice_record_type, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(pnl, label='Imaging Modality:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.choice_modality = wx.Choice(pnl, choices=['None', 'Widefield', '2P', 'Miniscope', 'Other'])
+        self.choice_modality.SetSelection(0)
+        grid.Add(self.choice_modality, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(pnl, label='Task / Protocol:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.txt_task = wx.TextCtrl(pnl, value='')
+        grid.Add(self.txt_task, 1, wx.EXPAND)
+        grid.AddGrowableCol(1, 1)
+        vbox.Add(grid, 0, wx.ALL|wx.EXPAND, 10)
+        vbox.Add(wx.StaticText(pnl, label='Pre-Recording Notes:'), 0, wx.LEFT|wx.RIGHT|wx.TOP, 10)
+        self.txt_notes = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1,120))
+        vbox.Add(self.txt_notes, 1, wx.ALL|wx.EXPAND, 10)
+        btns = self.CreateSeparatedButtonSizer(wx.OK|wx.CANCEL)
+        vbox.Add(btns, 0, wx.ALL|wx.EXPAND, 8)
+        pnl.SetSizer(vbox)
+        self.SetSizerAndFit(vbox)
+        self.SetMinSize((450, 380))
+
+    def get_values(self):
+        return {
+            'recording_type': self.choice_record_type.GetStringSelection(),
+            'modality': self.choice_modality.GetStringSelection(),
+            'task_protocol': self.txt_task.GetValue().strip(),
+            'pre_notes': self.txt_notes.GetValue().strip(),
+        }
+
+
+class PostRecordDialog(wx.Dialog):
+    """Collect post-recording outcomes and notes."""
+    def __init__(self, parent, prerecord_context=None):
+        super().__init__(parent, title='Post-Recording Details', style=wx.DEFAULT_DIALOG_STYLE|wx.RESIZE_BORDER)
+        pnl = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        if prerecord_context:
+            info_str = f"Type: {prerecord_context.get('recording_type','')}  Modality: {prerecord_context.get('modality','')}  Task: {prerecord_context.get('task_protocol','')}"
+            vbox.Add(wx.StaticText(pnl, label=info_str), 0, wx.ALL, 10)
+        grid = wx.FlexGridSizer(0, 2, 6, 8)
+        grid.Add(wx.StaticText(pnl, label='Outcome:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.choice_outcome = wx.Choice(pnl, choices=['Completed', 'Aborted Early', 'Technical Issue', 'Other'])
+        self.choice_outcome.SetSelection(0)
+        grid.Add(self.choice_outcome, 1, wx.EXPAND)
+        grid.Add(wx.StaticText(pnl, label='Data Quality:'), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.choice_quality = wx.Choice(pnl, choices=['Good', 'Fair', 'Poor', 'Unknown'])
+        self.choice_quality.SetSelection(0)
+        grid.Add(self.choice_quality, 1, wx.EXPAND)
+        grid.AddGrowableCol(1, 1)
+        vbox.Add(grid, 0, wx.ALL|wx.EXPAND, 10)
+        vbox.Add(wx.StaticText(pnl, label='Post-Recording Notes:'), 0, wx.LEFT|wx.RIGHT|wx.TOP, 10)
+        self.txt_notes = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1,140))
+        vbox.Add(self.txt_notes, 1, wx.ALL|wx.EXPAND, 10)
+        btns = self.CreateSeparatedButtonSizer(wx.OK|wx.CANCEL)
+        vbox.Add(btns, 0, wx.ALL|wx.EXPAND, 8)
+        pnl.SetSizer(vbox)
+        self.SetSizerAndFit(vbox)
+        self.SetMinSize((460, 360))
+
+    def get_values(self):
+        return {
+            'outcome': self.choice_outcome.GetStringSelection(),
+            'quality': self.choice_quality.GetStringSelection(),
+            'post_notes': self.txt_notes.GetValue().strip(),
+        }

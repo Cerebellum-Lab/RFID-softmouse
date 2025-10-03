@@ -240,8 +240,8 @@ async def export_animals(args):
             return
         # --- Simplified Strategy A only: click export -> capture taskid -> cookie replay (with optional direct navigation attempt) ---
         export_start_wall = time.time()
-        taskid_capture: dict[str, str | None] = {'taskid': None}
-        placeholder_seen: dict[str, bool] = {'ok': False}
+        taskid_capture: dict = {'taskid': None}  # type: ignore (python 3.7 compat)
+        placeholder_seen: dict = {'ok': False}
 
         async def _inspect_response(resp):
             try:
@@ -282,7 +282,7 @@ async def export_animals(args):
         taskid = taskid_capture['taskid']  # type: ignore
         # Optional: attempt direct navigation first (may or may not yield event). We give it 6 seconds.
         direct_path = await _direct_taskid_download(context, args.base_url, taskid, wait_seconds=6.0)
-        path_final: pathlib.Path | None = None
+        path_final = None  # type: Optional[pathlib.Path]
         if direct_path and direct_path.stat().st_size > 1024:
             path_final = direct_path
             log.info('Direct navigation produced a file (%d bytes).', path_final.stat().st_size)
@@ -346,7 +346,7 @@ async def _any_selector_exists(page: Page, selector_group: str) -> bool:
 async def _guess_extension(*args, **kwargs):  # retained for compatibility (no longer used)
     return '.xlsx'
 
-async def _direct_taskid_download(context, base_url: str, taskid: str, wait_seconds: float) -> pathlib.Path | None:
+async def _direct_taskid_download(context, base_url: str, taskid: str, wait_seconds: float):  # -> Optional[pathlib.Path]
     """Attempt to force a real browser download via top-level navigation using the known taskid.
 
     We open a temporary page and navigate directly to the downLoadFile endpoint. If Playwright emits a
@@ -393,7 +393,7 @@ async def _direct_taskid_download(context, base_url: str, taskid: str, wait_seco
             pass
     return None
 
-async def _cookie_replay_download(context, base_url: str, taskid: str) -> pathlib.Path | None:
+async def _cookie_replay_download(context, base_url: str, taskid: str):  # -> Optional[pathlib.Path]
     """Replay request using session cookies via requests to fetch the real binary.
 
     Returns a path or None. Only used in --direct-only mode when navigation did not yield a download.

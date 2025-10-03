@@ -30,7 +30,9 @@ if not _root.handlers:
     _root.addHandler(stream)
 
 
-def get_logger(name: str | None = None) -> logging.Logger:
+from typing import Optional
+
+def get_logger(name = None) -> logging.Logger:  # name: Optional[str]
     if name and name.startswith('rfidsoftmouse.'):
         return logging.getLogger(name)
     if name:

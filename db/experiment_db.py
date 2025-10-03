@@ -168,6 +168,34 @@ class ExperimentDB:
             qmarks = ','.join('?' for _ in ids)
             cx.execute(f'UPDATE sessions SET synced=1, updated_utc=? WHERE id IN ({qmarks})', [now, *ids])
 
+    # -------------- history queries --------------
+    def list_sessions_for_mouse(self, rfid: str, limit: int = 50) -> List[dict]:
+        """Return recent sessions for a mouse (most recent first)."""
+        with self._lock, self._connect() as cx:
+            cur = cx.execute('''SELECT id, start_utc, stop_utc, prerecord, postrecord, session_notes, was_live_only, session_dir
+                                 FROM sessions WHERE rfid=? ORDER BY start_utc DESC LIMIT ?''', (rfid, limit))
+            rows = cur.fetchall()
+        out: List[dict] = []
+        for r in rows:
+            def _load(txt):
+                if txt is None:
+                    return None
+                try:
+                    return json.loads(txt)
+                except Exception:
+                    return None
+            out.append({
+                'id': r[0],
+                'start_utc': r[1],
+                'stop_utc': r[2],
+                'prerecord': _load(r[3]),
+                'postrecord': _load(r[4]),
+                'session_notes': _load(r[5]),
+                'was_live_only': bool(r[6]),
+                'session_dir': r[7]
+            })
+        return out
+
 # -------------- Remote sync placeholder --------------
 class RemoteSyncClient:
     """Placeholder remote client.

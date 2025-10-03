@@ -27,9 +27,9 @@ cam2:
 
 # User information
 unitRef: Ben
-raw_data_dir: C:\Users\reynoben\Documents
-interim_data_dir: C:\Users\reynoben\Documents
-compressed_data_dir: C:\Users\reynoben\Documents
+raw_data_dir: C:\Users\reynoben\Documents\RFID-softmouse\RawDataTest
+interim_data_dir: C:\Users\reynoben\Documents\RFID-softmouse\InterimDataTest
+compressed_data_dir: C:\Users\reynoben\Documents\RFID-softmouse\CompressedDataTest
 COM: 3
 
 # Stim ROI

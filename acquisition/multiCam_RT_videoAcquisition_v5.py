@@ -528,6 +528,7 @@ class MainFrame(wx.Frame):
         config_menu = wx.Menu()
         self.menu_softmouse_cfg = config_menu.Append(wx.ID_ANY, 'SoftMouse Config\tCtrl+M')
         self.menu_rfid_cfg = config_menu.Append(wx.ID_ANY, 'RFID Config\tCtrl+R')
+        self.menu_session_history = config_menu.Append(wx.ID_ANY, 'Session History\tCtrl+H')
         menubar.Append(config_menu, '&Config')
         self.SetMenuBar(menubar)
         # Import dialogs now that menu is created (deferred import to keep top clean)
@@ -536,6 +537,7 @@ class MainFrame(wx.Frame):
         self._RFIDConfigDialogClass = RFIDConfigDialog
         self.Bind(wx.EVT_MENU, self.onOpenSoftMouseConfig, self.menu_softmouse_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenRFIDConfig, self.menu_rfid_cfg)
+        self.Bind(wx.EVT_MENU, self.onOpenSessionHistory, self.menu_session_history)
 
     # ---------------- Dialog open handlers (stubs) ----------------
     def onOpenSoftMouseConfig(self, event):
@@ -552,6 +554,30 @@ class MainFrame(wx.Frame):
         try:
             dlg = self._RFIDConfigDialogClass(self)
             dlg.ShowModal()
+        finally:
+            try:
+                dlg.Destroy()
+            except Exception:
+                pass
+
+    def onOpenSessionHistory(self, event):
+        try:
+            if not getattr(self, 'mouse_meta', None) or not self.mouse_meta.get('rfid'):
+                wx.MessageBox('No current RFID selected (scan or lookup first).', 'Session History', style=wx.OK|wx.ICON_INFORMATION)
+                return
+            self._ensure_local_db()
+            if not getattr(self, '_db_init_done', False):
+                wx.MessageBox('Local database not initialized.', 'Session History', style=wx.OK|wx.ICON_WARNING)
+                return
+            rfid = self.mouse_meta.get('rfid')
+            sessions = self.local_db.list_sessions_for_mouse(rfid, limit=100)
+            dlg = SessionHistoryDialog(self, rfid, sessions)
+            dlg.ShowModal()
+        except Exception as e:
+            try:
+                self.log.error('Failed opening session history: %s', e)
+            except Exception:
+                pass
         finally:
             try:
                 dlg.Destroy()
@@ -981,7 +1007,7 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
 
-    def _finalize_db_session(self, post_ctx: dict | None, session_notes: dict | None):
+    def _finalize_db_session(self, post_ctx, session_notes):  # types: Optional[dict]
         if not getattr(self, '_active_session_id', None):
             return
         if not getattr(self, '_db_init_done', False):
@@ -1123,20 +1149,6 @@ class MainFrame(wx.Frame):
         user_list = [name for name in os.listdir(self.userDir) if name.endswith('.yaml')]
         user_list = [name[:-14] for name in user_list]
         self.current_user = 'Default'
-        # If stopping live feed and we had a live-only DB session open, finalize it with a quick post dialog
-        if (not self.play.GetValue()) and getattr(self, '_live_only_active', False) and getattr(self, '_active_session_id', None):
-            post_ctx = None
-            try:
-                dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
-                if dlg2.ShowModal() == wx.ID_OK:
-                    post_ctx = dlg2.get_values()
-                dlg2.Destroy()
-            except Exception:
-                pass
-            try:
-                self._finalize_db_session(post_ctx, session_notes=None)
-            except Exception:
-                pass
         if not len(user_list):
             user_list = [self.current_user]
         else:
@@ -1525,6 +1537,43 @@ class MainFrame(wx.Frame):
             self.rec.Enable(True)
             for h in self.disable4cam:
                 h.Enable(True)
+        # Live-only prerecord (start) logic
+        if self.play.GetValue() and hasattr(self, 'save_to_db') and self.save_to_db.GetValue():
+            if getattr(self, 'mouse_meta', None) and not getattr(self, '_live_only_active', False):
+                try:
+                    dlg = PreRecordDialog(self)
+                    if hasattr(self, '_last_session_context') and self._last_session_context and self._last_session_context.get('prerecord'):
+                        try:
+                            prev = self._last_session_context['prerecord']
+                            dlg.choice_record_type.SetStringSelection(prev.get('recording_type', dlg.choice_record_type.GetStringSelection()))
+                            dlg.choice_modality.SetStringSelection(prev.get('modality', dlg.choice_modality.GetStringSelection()))
+                            dlg.txt_task.SetValue(prev.get('task_protocol',''))
+                            dlg.txt_notes.SetValue(prev.get('pre_notes',''))
+                        except Exception:
+                            pass
+                    if dlg.ShowModal() == wx.ID_OK:
+                        ctx = dlg.get_values()
+                        self._prerecord_context = ctx
+                        rfid = self.mouse_meta.get('rfid') if isinstance(self.mouse_meta, dict) else None
+                        if rfid:
+                            self._start_db_session_if_needed(rfid, ctx, was_live_only=True, session_dir=None, yaml_path=None)
+                    dlg.Destroy()
+                except Exception:
+                    pass
+        # Live-only finalize (stop) logic
+        if (not self.play.GetValue()) and getattr(self, '_live_only_active', False) and getattr(self, '_active_session_id', None):
+            post_ctx = None
+            try:
+                dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
+                if dlg2.ShowModal() == wx.ID_OK:
+                    post_ctx = dlg2.get_values()
+                dlg2.Destroy()
+            except Exception:
+                pass
+            try:
+                self._finalize_db_session(post_ctx, session_notes=None)
+            except Exception:
+                pass
         
     def pelletHandler(self, pim, roi):
         # events    0 - release pellet
@@ -1943,6 +1992,12 @@ class MainFrame(wx.Frame):
                     jf = _pl.Path(self.sess_dir) / 'session_notes.json'
                     with jf.open('w', encoding='utf-8') as fh:
                         json.dump(merged, fh, indent=2)
+                    # Finalize DB session now (if enabled)
+                    try:
+                        if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
+                            self._finalize_db_session(post_context, session_notes=merged)
+                    except Exception:
+                        pass
             except Exception as _e:
                 try:
                     self.log.error('Failed writing session_notes.json: %s', _e)
@@ -2374,3 +2429,51 @@ class PostRecordDialog(wx.Dialog):
             'quality': self.choice_quality.GetStringSelection(),
             'post_notes': self.txt_notes.GetValue().strip(),
         }
+
+
+class SessionHistoryDialog(wx.Dialog):
+    """Display recent sessions for the current RFID with basic details and JSON preview."""
+    def __init__(self, parent, rfid: str, sessions: list):
+        super().__init__(parent, title=f'Session History - RFID {rfid}', style=wx.DEFAULT_DIALOG_STYLE|wx.RESIZE_BORDER)
+        self.sessions = sessions
+        pnl = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        self.list_ctrl = wx.ListCtrl(pnl, style=wx.LC_REPORT|wx.BORDER_SUNKEN)
+        cols = ['Start (UTC)', 'Stop (UTC)', 'Type', 'Modality', 'Task', 'Outcome', 'Quality', 'LiveOnly', 'Dir']
+        for i, c in enumerate(cols):
+            self.list_ctrl.InsertColumn(i, c)
+        for sess in sessions:
+            prerec = (sess.get('prerecord') or {})
+            postrec = (sess.get('postrecord') or {})
+            idx = self.list_ctrl.InsertItem(self.list_ctrl.GetItemCount(), sess.get('start_utc',''))
+            self.list_ctrl.SetItem(idx, 1, sess.get('stop_utc',''))
+            self.list_ctrl.SetItem(idx, 2, prerec.get('recording_type',''))
+            self.list_ctrl.SetItem(idx, 3, prerec.get('modality',''))
+            self.list_ctrl.SetItem(idx, 4, prerec.get('task_protocol',''))
+            self.list_ctrl.SetItem(idx, 5, postrec.get('outcome',''))
+            self.list_ctrl.SetItem(idx, 6, postrec.get('quality',''))
+            self.list_ctrl.SetItem(idx, 7, 'Y' if sess.get('was_live_only') else '')
+            self.list_ctrl.SetItem(idx, 8, os.path.basename(sess.get('session_dir') or '') )
+            self.list_ctrl.SetItemData(idx, idx)
+        for i in range(len(cols)):
+            self.list_ctrl.SetColumnWidth(i, wx.LIST_AUTOSIZE_USEHEADER)
+        vbox.Add(self.list_ctrl, 1, wx.ALL|wx.EXPAND, 8)
+        self.json_preview = wx.TextCtrl(pnl, style=wx.TE_MULTILINE|wx.TE_READONLY)
+        vbox.Add(self.json_preview, 1, wx.ALL|wx.EXPAND, 8)
+        btns = self.CreateSeparatedButtonSizer(wx.OK)
+        vbox.Add(btns, 0, wx.ALL|wx.EXPAND, 5)
+        pnl.SetSizer(vbox)
+        self.SetSizerAndFit(vbox)
+        self.SetMinSize((900, 500))
+        self.list_ctrl.Bind(wx.EVT_LIST_ITEM_SELECTED, self.onSelect)
+
+    def onSelect(self, event):
+        idx = event.GetIndex()
+        if idx < 0 or idx >= len(self.sessions):
+            return
+        import json
+        try:
+            txt = json.dumps(self.sessions[idx].get('session_notes') or {}, indent=2)
+        except Exception:
+            txt = '(invalid JSON)'
+        self.json_preview.SetValue(txt)

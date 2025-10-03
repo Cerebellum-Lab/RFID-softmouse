@@ -28,7 +28,9 @@ DEFAULT_CANDIDATE_URLS = [
 	'https://app.softmouse.com',
 ]
 
-def resolve_base_urls(cli_url: str | None) -> list[str]:
+from typing import Optional, List
+
+def resolve_base_urls(cli_url):  # cli_url: Optional[str] -> List[str]
 	env_url = os.getenv('SOFTMOUSE_BASE_URL', '').strip() or None
 	chosen = []
 	for u in [cli_url, env_url]:
@@ -139,7 +141,7 @@ def _dump_debug(html: str, base: str):
 	except Exception as e: log.warning('Failed writing debug HTML: %s', e)
 
 async def login(page, user: str, pwd: str, timeout: float, candidate_urls: list[str], debug: bool=False, screenshot: bool=False):
-	last_error: Exception | None = None
+	last_error = None  # type: Optional[Exception]
 	for base in candidate_urls:
 		try:
 			log.info('Navigating to %s', base)

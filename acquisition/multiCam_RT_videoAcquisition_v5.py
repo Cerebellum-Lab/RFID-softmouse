@@ -1728,6 +1728,58 @@ class MainFrame(wx.Frame):
             try:
                 import json, datetime as _dt, pathlib as _pl
                 if hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
+                    # Extended fields collection
+                    try:
+                        import platform as _pf, psutil as _ps
+                    except Exception:
+                        _pf = None; _ps = None
+                    # System / environment snapshot
+                    env_info = {}
+                    try:
+                        import sys as _sys
+                        env_info['python_version'] = _sys.version.split()[0]
+                        if _pf:
+                            env_info['platform'] = _pf.platform()
+                            env_info['machine'] = _pf.machine()
+                            env_info['processor'] = _pf.processor()
+                        if _ps:
+                            env_info['cpu_percent'] = _ps.cpu_percent(interval=0.1)
+                            env_info['virtual_memory'] = dict(total=_ps.virtual_memory().total, available=_ps.virtual_memory().available)
+                    except Exception:
+                        pass
+                    # Video file inventory (augment with hashes & sizes)
+                    video_files = []
+                    try:
+                        import hashlib as _hash
+                        for f in os.scandir(self.sess_dir):
+                            if f.is_file() and f.name.lower().endswith(('.avi', '.mp4', '.mkv', '.mov')):
+                                h = None
+                                try:
+                                    with open(f.path, 'rb') as _vf:
+                                        chunk = _vf.read(1024 * 1024)
+                                        dig = _hash.sha256()
+                                        dig.update(chunk)
+                                        h = dig.hexdigest()[:16]
+                                except Exception:
+                                    pass
+                                video_files.append({'name': f.name, 'size_bytes': f.stat().st_size, 'sha256_prefix': h})
+                    except Exception:
+                        pass
+                    # Camera configuration snapshot
+                    cam_cfg = []
+                    try:
+                        for idx, cam_key in enumerate(self.camStrList):
+                            cam_cfg.append({
+                                'key': cam_key,
+                                'serial': self.system_cfg.get(cam_key, {}).get('serial'),
+                                'nickname': self.system_cfg.get(cam_key, {}).get('nickname'),
+                                'ismaster': self.system_cfg.get(cam_key, {}).get('ismaster'),
+                                'crop_roi': self.croproi[idx] if idx < len(self.croproi) else None,
+                            })
+                    except Exception:
+                        pass
+                    # Stim events placeholder (could be populated elsewhere later)
+                    stim_events = getattr(self, '_stim_events', [])
                     merged = {
                         'timestamp': _dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
                         'rfid': getattr(self.mouse_meta, 'rfid', None) if isinstance(getattr(self, 'mouse_meta', None), dict) else (self.mouse_meta.get('rfid') if getattr(self, 'mouse_meta', None) else None),
@@ -1736,6 +1788,10 @@ class MainFrame(wx.Frame):
                         'postrecord': post_context,
                         'duration_seconds': self.meta.get('duration (s)'),
                         'stim_protocol': getattr(self, 'proto_str', None),
+                        'camera_config': cam_cfg,
+                        'environment': env_info,
+                        'video_files': video_files,
+                        'stim_events': stim_events,
                     }
                     jf = _pl.Path(self.sess_dir) / 'session_notes.json'
                     with jf.open('w', encoding='utf-8') as fh:

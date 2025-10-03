@@ -1,7 +1,7 @@
 # Migrated system configuration (originally at project root)
 # Camera reference (enter serial numbers for each)
 cam1:
-  serial: 24122967
+  serial: 20186205
   ismaster: true
   crop:
   - 53
@@ -13,7 +13,7 @@ cam1:
   bin: 4
   nickname: sideCam
 cam2:
-  serial: 24132859
+  serial: 20186214
   ismaster: false
   crop:
   - 53

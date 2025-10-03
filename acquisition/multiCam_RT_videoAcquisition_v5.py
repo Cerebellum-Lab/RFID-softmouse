@@ -393,22 +393,16 @@ class MainFrame(wx.Frame):
         start_text = wx.StaticText(self.widget_panel, label='Inspect values within ROIs:')
         wSpacer.Add(start_text, pos=(vpos,0), span=(0,3), flag=wx.LEFT, border=wSpace)
         
+        # --- New: Save to Database checkbox ---
         vpos+=1
+        self.save_to_db = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Save to DB (sessions/live)")
+        wSpacer.Add(self.save_to_db, pos=(vpos,0), span=(0,2), flag=wx.LEFT, border=wSpace)
+        self.save_to_db.SetValue(True)
+        self.save_to_db.Bind(wx.EVT_CHECKBOX, lambda evt: None)
         
-        self.inspect_stim = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Stimulus")
-        wSpacer.Add(self.inspect_stim, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.inspect_stim.SetValue(0)
-        self.inspect_stim.Enable(False)
-        
-        self.inspect_hand = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Hand")
-        wSpacer.Add(self.inspect_hand, pos=(vpos,1), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.inspect_hand.SetValue(0)
-        
-        self.inspect_pellet = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Pellet")
-        wSpacer.Add(self.inspect_pellet, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
-        self.inspect_pellet.SetValue(0)
+        vpos+=1
 
-        vpos+=2
+        # Compress videos button
         self.compress_vid = wx.Button(self.widget_panel, id=wx.ID_ANY, label="Compress Vids")
         wSpacer.Add(self.compress_vid, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
         self.compress_vid.Bind(wx.EVT_BUTTON, self.compressVid)
@@ -603,6 +597,15 @@ class MainFrame(wx.Frame):
         except Exception:
             rfid_cfg['baud'] = 9600
         rfid_cfg['autostart'] = bool(getattr(self, '_rfid_autostart', rfid_cfg.get('autostart', False)))
+        # Persist database section
+        db_cfg = self.user_cfg.setdefault('database', {})
+        try:
+            db_cfg['save_enabled'] = bool(self.save_to_db.GetValue()) if hasattr(self, 'save_to_db') else db_cfg.get('save_enabled', True)
+        except Exception:
+            db_cfg['save_enabled'] = db_cfg.get('save_enabled', True)
+        # Remote endpoint / auth token placeholders (future use)
+        db_cfg.setdefault('remote_endpoint', '')
+        db_cfg.setdefault('remote_api_token', '')
         try:
             with open(configname, 'w') as cf:
                 ruamelFile = ruamel.yaml.YAML()
@@ -679,6 +682,13 @@ class MainFrame(wx.Frame):
         except Exception:
             self._rfid_baud_value = 9600
         self._rfid_autostart = bool(rfid_cfg.get('autostart', False))
+        # ---- Load database section ----
+        db_cfg = self.user_cfg.get('database') or {}
+        if hasattr(self, 'save_to_db'):
+            try:
+                self.save_to_db.SetValue(bool(db_cfg.get('save_enabled', True)))
+            except Exception:
+                pass
         # Mirror to legacy widgets if present
         try:
             if hasattr(self, 'rfid_port') and isinstance(self.rfid_port, wx.TextCtrl) and self._rfid_port_value:
@@ -928,6 +938,101 @@ class MainFrame(wx.Frame):
         self.statusbar.SetStatusText('RFID listener stopped')
         self.log.info('RFID listener stopped')
 
+    def _populate_from_last_session(self, rfid: str):
+        self._ensure_local_db()
+        if not getattr(self, '_db_init_done', False):
+            return
+        try:
+            last = self.local_db.last_session_for_mouse(rfid)
+            if not last:
+                return
+            # Pre-fill prerecord dialog context for next session
+            self._last_session_context = last
+        except Exception:
+            pass
+
+    def _start_db_session_if_needed(self, rfid: str, prerecord_ctx: dict, was_live_only: bool, session_dir, yaml_path):
+        self._ensure_local_db()
+        if not getattr(self, '_db_init_done', False):
+            return
+        try:
+            self.local_db.ensure_mouse(rfid, softmouse_payload=getattr(self, 'mouse_meta', None))
+            self._active_session_id = self.local_db.start_session(rfid, prerecord_ctx, was_live_only=was_live_only, session_dir=session_dir, metadata_yaml_path=yaml_path)
+            self._live_only_active = was_live_only
+        except Exception as e:
+            try:
+                self.log.error('Failed starting DB session: %s', e)
+            except Exception:
+                pass
+
+    def _update_db_session_paths(self, session_dir: str, yaml_path: str):
+        if not getattr(self, '_active_session_id', None):
+            return
+        if not getattr(self, '_db_init_done', False):
+            return
+        try:
+            # direct SQL update (no public method earlier to keep API small)
+            import sqlite3, datetime as _dt
+            now = _dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+            cx = sqlite3.connect(self.local_db.db_path)
+            with cx:
+                cx.execute('UPDATE sessions SET session_dir=?, metadata_yaml_path=?, updated_utc=? WHERE id=?', (session_dir, yaml_path, now, self._active_session_id))
+            cx.close()
+        except Exception:
+            pass
+
+    def _finalize_db_session(self, post_ctx: dict | None, session_notes: dict | None):
+        if not getattr(self, '_active_session_id', None):
+            return
+        if not getattr(self, '_db_init_done', False):
+            return
+        try:
+            self.local_db.finalize_session(self._active_session_id, post_ctx, session_notes=session_notes)
+        except Exception as e:
+            try:
+                self.log.error('Failed finalizing DB session: %s', e)
+            except Exception:
+                pass
+        finally:
+            self._active_session_id = None
+            self._live_only_active = False
+
+    def _sync_remote_if_requested(self):
+        # Called on compression to push unsynced rows
+        self._ensure_local_db()
+        if not getattr(self, '_db_init_done', False):
+            return 0
+        try:
+            from db.experiment_db import RemoteSyncClient, push_unsynced
+            remote = RemoteSyncClient()  # TODO: parameterize endpoint
+            pushed = push_unsynced(self.local_db, remote)
+            if pushed:
+                self.log.info('Remote sync pushed %d sessions', pushed)
+            return pushed
+        except Exception as e:
+            try:
+                self.log.error('Remote sync failed: %s', e)
+            except Exception:
+                pass
+            return 0
+
+    def _ensure_local_db(self):
+        if self._db_init_done:
+            return
+        try:
+            from db.experiment_db import ExperimentDB
+            root = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
+            root = os.path.abspath(root)
+            self.local_db = ExperimentDB(root)
+            self._db_init_done = True
+            self.log.info('Local experiment DB initialized path=%s', getattr(self.local_db, 'db_path', '?'))
+        except Exception as e:
+            try:
+                self.log.error('Failed initializing local DB: %s', e)
+            except Exception:
+                pass
+            self._db_init_done = False
+
     def _handle_rfid_tag(self, tag: str):
         # Sanitize and enforce alphanumeric tag
         raw = tag
@@ -949,6 +1054,16 @@ class MainFrame(wx.Frame):
                         self.mouse_meta['rfid'] = tag
                         name = self.mouse_meta.get('Name') or self.mouse_meta.get('name')
                         break
+        # If no match locally and user wants DB integration, attempt SoftMouse refresh on-demand (placeholder)
+        if not name and getattr(self, 'save_to_db', None) and self.save_to_db.GetValue():
+            try:
+                # Trigger a background export if animals metadata absent or stale
+                if not hasattr(self, 'animal_metadata') or getattr(self, 'animal_export_active', False) is False:
+                    # Could call startAnimalExport but we need colony; rely on existing colony stored
+                    if hasattr(self, '_softmouse_last_colony') and self._softmouse_last_colony:
+                        self.startAnimalExport(None)
+            except Exception:
+                pass
         msg = f'RFID tag {tag}' + (f' matched {name}' if name else ' (no match)')
         self.rfid_status.SetLabel(msg[:30])
         self.statusbar.SetStatusText(msg)
@@ -960,6 +1075,11 @@ class MainFrame(wx.Frame):
             else:
                 self.log.info('RFID %s rejected by user', tag)
             dlg.Destroy()
+        # Populate last session context if any
+        try:
+            self._populate_from_last_session(tag)
+        except Exception:
+            pass
         
     def setProtocol(self, event):
         self.proto_str = self.protocol.GetStringSelection()
@@ -1003,6 +1123,20 @@ class MainFrame(wx.Frame):
         user_list = [name for name in os.listdir(self.userDir) if name.endswith('.yaml')]
         user_list = [name[:-14] for name in user_list]
         self.current_user = 'Default'
+        # If stopping live feed and we had a live-only DB session open, finalize it with a quick post dialog
+        if (not self.play.GetValue()) and getattr(self, '_live_only_active', False) and getattr(self, '_active_session_id', None):
+            post_ctx = None
+            try:
+                dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
+                if dlg2.ShowModal() == wx.ID_OK:
+                    post_ctx = dlg2.get_values()
+                dlg2.Destroy()
+            except Exception:
+                pass
+            try:
+                self._finalize_db_session(post_ctx, session_notes=None)
+            except Exception:
+                pass
         if not len(user_list):
             user_list = [self.current_user]
         else:
@@ -1325,7 +1459,14 @@ class MainFrame(wx.Frame):
             compressThread = compressVideos.CLARA_compress()
             compressThread.start()
             self.compress_vid.Enable(False)
-        
+            # After launching compression, attempt remote sync (non-blocking best-effort)
+            try:
+                pushed = self._sync_remote_if_requested()
+                if pushed:
+                    self.statusbar.SetStatusText(f'Remote synced {pushed} sessions')
+            except Exception:
+                pass
+    
     def camReset(self,event):
         self.initThreads()
         self.camaq.value = 2
@@ -1447,7 +1588,7 @@ class MainFrame(wx.Frame):
                     self.pellet_status = 2
                     print("delay time")
 
-            elif self.pellet_status == 2:
+            elif self.pellet_status ==  2:
                 reveal_pellet = False
                 if roi < self.system_cfg['handThreshold']:
                     if self.auto_delay.GetValue():
@@ -1463,7 +1604,7 @@ class MainFrame(wx.Frame):
                             if self.first_delay == self.delay_values[0]:
                                 self.make_delay_iters()
                             reveal_pellet = True
-                    elif (time.time()-self.hand_timing) > self.user_cfg['waitAfterHand']:
+                    elif (time.time()-self.hand_timing) > self.user_cfg['maxWait4Hand']:
                         reveal_pellet = True
                 elif (time.time()-self.pellet_timing) > self.user_cfg['maxWait4Hand']:
                     getNewPellet = True
@@ -1648,6 +1789,12 @@ class MainFrame(wx.Frame):
             syscopyname = '%s_%s_%s_systemdata_copy.yaml' % (date_string, self.system_cfg['unitRef'], sess_string)
             shutil.copyfile(usrconfigname,os.path.join(self.sess_dir,usrcopyname))
             shutil.copyfile(sysconfigname,os.path.join(self.sess_dir,syscopyname))
+            # Update DB session paths now that they are known
+            try:
+                if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
+                    self._update_db_session_paths(self.sess_dir, self.metapath)
+            except Exception:
+                pass
             
             
             for ndx, s in enumerate(self.camStrList):

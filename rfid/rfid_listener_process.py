@@ -50,36 +50,68 @@ def run_rfid_listener(port: str, baud: int, q, stop_event, poll_interval: float 
         report_error('pyserial not installed')
         return
 
+    log.info('Opening serial port attempt port=%s baud=%s', port, baud)
     try:
         ser = serial.Serial(port, baudrate=baud, timeout=0)
     except Exception as e:  # pragma: no cover
         report_error(f'open failed: {e}', e, trace=False)
         return
+    else:
+        try:
+            log.info('Serial port open success port=%s baud=%s bytesize=%s parity=%s stopbits=%s',
+                     port, baud, getattr(ser, 'bytesize', '?'), getattr(ser, 'parity', '?'), getattr(ser, 'stopbits', '?'))
+        except Exception:
+            pass
 
     buf = bytearray()
     MAX_LINE_LEN = 512  # safeguard against unbroken stream
     log.info('RFID listener started port=%s baud=%s', port, baud)
 
+    # Dedup state
+    last_tag: str | None = None
+    last_tag_time: float = 0.0
+    DEDUP_WINDOW = 1.0  # seconds
+
+    TAG_LEN = 15  # expected ASCII alphanumeric length
+
     def analyze_line(raw_bytes: bytes) -> dict:
-        """Return analysis dict about the raw line prior to queue emission."""
-        stripped = raw_bytes.strip()
-        tag = ''.join(chr(c) for c in stripped if chr(c).isalnum())
-        all_alnum_original = all(chr(c).isalnum() for c in stripped)
-        formatting_ok = (len(tag) == len(stripped) and all_alnum_original)
-        if not tag:
-            reason = 'no_alnum_chars'
-        elif not formatting_ok:
-            reason = 'removed_non_alnum'
+        """Parse raw line into fixed 15-char ASCII alphanumeric tag.
+
+        - Keep only 0-9, A-Z, a-z characters (exclude extended bytes like \xf4 even if isalnum()).
+        - Detect repeated concatenations of the same 15-char block.
+        - Truncate longer sequences to first 15 chars.
+        - Only 'expected' if we have exactly 15 ASCII alnum chars after cleaning.
+        """
+        stripped = raw_bytes.strip(b'\r\n\x00')
+        ascii_alnum = ''.join(chr(c) for c in stripped if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122))
+        reason_parts = []
+        duplicate = False
+        truncated = False
+        if not ascii_alnum:
+            reason_parts.append('no_alnum')
+        if len(ascii_alnum) >= 2*TAG_LEN and ascii_alnum[:TAG_LEN] == ascii_alnum[TAG_LEN:2*TAG_LEN]:
+            duplicate = True
+            reason_parts.append('duplicate_block')
+        if len(ascii_alnum) >= TAG_LEN:
+            final_tag = ascii_alnum[:TAG_LEN]
+            if len(ascii_alnum) > TAG_LEN:
+                truncated = True
+                reason_parts.append('truncated_extra')
         else:
-            reason = 'ok'
-        expected = bool(tag)  # Adjust this rule if a stricter expectation is required
+            final_tag = ascii_alnum
+            reason_parts.append('too_short')
+        if not reason_parts:
+            reason_parts.append('ok')
+        expected = (len(final_tag) == TAG_LEN)
         return {
             'raw': raw_bytes,
             'stripped': stripped,
-            'tag': tag,
-            'formatting_ok': formatting_ok,
+            'ascii_alnum': ascii_alnum,
+            'final_tag': final_tag,
             'expected': expected,
-            'reason': reason,
+            'duplicate': duplicate,
+            'truncated': truncated,
+            'reason': '+'.join(reason_parts)
         }
 
     try:
@@ -99,45 +131,50 @@ def run_rfid_listener(port: str, baud: int, q, stop_event, poll_interval: float 
                     log.warning('Shrinking runaway buffer size=%d', len(buf))
                     del buf[:-MAX_LINE_LEN]  # keep last segment
 
-                # Process complete lines (LF or CR)
+                # Immediate emit strategy: first look for newline-delimited frames; else emit mid-buffer when ready
                 start = 0
+                emitted = False
                 for i, bch in enumerate(buf):
-                    if bch in (10, 13):  # \n or \r
-                        line_bytes = buf[start:i]
+                    if bch in (10, 13):
+                        frame = buf[start:i]
                         start = i + 1
-                        line = line_bytes.strip()
-                        if not line:
-                            log.debug('Discarding empty (whitespace) line raw=%r', line_bytes)
+                        if not frame.strip():
                             continue
-                        if len(line) > MAX_LINE_LEN:
-                            log.warning('Discarding overlong line (%d bytes) raw=%r', len(line), line_bytes)
-                            continue
-
-                        analysis = analyze_line(line_bytes)
-                        log.info(
-                            'Line received raw=%r stripped=%r tag=%r formatting_ok=%s expected=%s reason=%s',
-                            analysis['raw'],
-                            analysis['stripped'],
-                            analysis['tag'],
-                            analysis['formatting_ok'],
-                            analysis['expected'],
-                            analysis['reason'],
-                        )
-
-                        tag = analysis['tag']
-                        if tag and analysis['expected']:
-                            event = {'tag': tag, 'ts': time.time()}
-                            try:
-                                q.put(event)
-                            except Exception:
-                                log.exception('Failed to enqueue tag event tag=%r', tag)
+                        analysis = analyze_line(frame)
+                        if analysis['expected']:
+                            now = time.time()
+                            if last_tag == analysis['final_tag'] and (now - last_tag_time) < DEDUP_WINDOW:
+                                log.debug('Duplicate tag suppressed tag=%s dt=%.3f', analysis['final_tag'], now - last_tag_time)
                             else:
-                                log.debug('Enqueued tag=%r', tag)
-                        else:
-                            log.debug('Tag not enqueued (expected=%s tag_present=%s)', analysis['expected'], bool(tag))
-                # Keep remainder (partial line)
+                                try:
+                                    q.put({'tag': analysis['final_tag'], 'ts': now})
+                                    log.info('Tag emitted tag=%s (EOL)', analysis['final_tag'])
+                                    last_tag = analysis['final_tag']
+                                    last_tag_time = now
+                                except Exception:
+                                    log.exception('Failed enqueue tag=%r (EOL)', analysis['final_tag'])
+                                emitted = True
                 if start:
                     del buf[:start]
+                if not emitted:
+                    # Mid-buffer attempt
+                    analysis_mid = analyze_line(bytes(buf))
+                    if analysis_mid['expected']:
+                        now = time.time()
+                        if last_tag == analysis_mid['final_tag'] and (now - last_tag_time) < DEDUP_WINDOW:
+                            log.debug('Duplicate tag suppressed tag=%s dt=%.3f (mid)', analysis_mid['final_tag'], now - last_tag_time)
+                        else:
+                            try:
+                                q.put({'tag': analysis_mid['final_tag'], 'ts': now})
+                                log.info('Tag emitted tag=%s (mid-buffer)', analysis_mid['final_tag'])
+                                last_tag = analysis_mid['final_tag']
+                                last_tag_time = now
+                            except Exception:
+                                log.exception('Failed enqueue tag=%r (mid)', analysis_mid['final_tag'])
+                        buf.clear()
+                else:
+                    # Clear entire buffer after processing newline-delimited emission(s)
+                    buf.clear()
             else:
                 # Nothing read; sleep briefly to avoid busy loop
                 time.sleep(poll_interval)
@@ -151,17 +188,19 @@ def run_rfid_listener(port: str, baud: int, q, stop_event, poll_interval: float 
             if buf:
                 line = bytes(buf).strip()
                 if line:
-                    analysis = {
-                        'raw': bytes(buf),
-                        'stripped': line,
-                        'tag': ''.join(chr(c) for c in line if chr(c).isalnum())
-                    }
-                    if analysis['tag']:
-                        try:
-                            q.put({'tag': analysis['tag'], 'ts': time.time(), 'partial': True})
-                            log.info('Flushed partial line raw=%r tag=%r', analysis['raw'], analysis['tag'])
-                        except Exception:
-                            log.exception('Failed to enqueue partial final tag')
+                    analysis = analyze_line(bytes(buf))
+                    if analysis['expected']:
+                        now = time.time()
+                        if last_tag == analysis['final_tag'] and (now - last_tag_time) < DEDUP_WINDOW:
+                            log.debug('Duplicate tag suppressed at flush tag=%s dt=%.3f', analysis['final_tag'], now - last_tag_time)
+                        else:
+                            try:
+                                q.put({'tag': analysis['final_tag'], 'ts': now, 'partial': True})
+                                log.info('Flushed partial line raw=%r final_tag=%r reason=%s', analysis['raw'], analysis['final_tag'], analysis['reason'])
+                                last_tag = analysis['final_tag']
+                                last_tag_time = now
+                            except Exception:
+                                log.exception('Failed to enqueue partial final tag')
             ser.close()
         except Exception:
             pass

@@ -959,6 +959,11 @@ class MainFrame(wx.Frame):
                 except Exception:
                     pass
             return
+        else:
+            try:
+                self.log.info('RFID starting using configured port=%s baud_candidate=%s', port, getattr(self, '_rfid_baud_value', 'unknown'))
+            except Exception:
+                pass
         try:
             baud = int(getattr(self, '_rfid_baud_value', 9600))
         except Exception:
@@ -985,6 +990,10 @@ class MainFrame(wx.Frame):
             self.rfid_proc.start()
         except Exception as e:
             self.statusbar.SetStatusText(f'RFID start error: {e}')
+            try:
+                self.log.error('RFID process start failure port=%s baud=%s err=%r', port, baud, e)
+            except Exception:
+                pass
             return
         self.rfid_listening = True
         self.rfid_status.SetLabel('RFID listening...')
@@ -1574,6 +1583,12 @@ class MainFrame(wx.Frame):
             self.play.SetValue(False)
                         
         elif self.play.GetValue() == True:
+            # Stop RFID listener during live acquisition
+            try:
+                if getattr(self, 'rfid_listening', False):
+                    self._stop_rfid_listener()
+            except Exception:
+                pass
             if not self.liveTimer.IsRunning():
                 if not self.pellet_x == 0:
                     if not self.roi[0] == 0:
@@ -1591,6 +1606,12 @@ class MainFrame(wx.Frame):
             self.stopAq()
             time.sleep(2)
             self.play.SetLabel('Live')
+            # Restart RFID listener after exiting live mode (if not recording)
+            try:
+                if not self.rec.GetValue():
+                    self._start_rfid_listener()
+            except Exception:
+                pass
 
         self.rec.Enable(True)
         for h in self.disable4cam:
@@ -1818,6 +1839,12 @@ class MainFrame(wx.Frame):
         
     def recordCam(self, event):
         if self.rec.GetValue():
+            # Stop RFID listener for duration of recording
+            try:
+                if getattr(self, 'rfid_listening', False):
+                    self._stop_rfid_listener()
+            except Exception:
+                pass
             # --- Pre-record dialog (only if RFID present) ---
             try:
                 if getattr(self, 'mouse_meta', None) and not getattr(self, '_prerecord_context', None):
@@ -1980,6 +2007,12 @@ class MainFrame(wx.Frame):
                     print(f'Failed to attach mouse metadata: {e}')
             clara.write_metadata(self.meta, self.metapath)
             self.log.info('Recording stopped session_dir=%s metadata_written=%s', self.sess_dir, self.metapath)
+            # Restart RFID listener after recording (if not in live mode)
+            try:
+                if not self.play.GetValue():
+                    self._start_rfid_listener()
+            except Exception:
+                pass
             # --- Post-record dialog ---
             post_context = None
             try:

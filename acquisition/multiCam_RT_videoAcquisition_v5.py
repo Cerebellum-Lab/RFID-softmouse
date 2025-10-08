@@ -375,6 +375,11 @@ class MainFrame(wx.Frame):
         self.rfid_status = wx.StaticText(self.widget_panel, label='RFID idle')
         wSpacer.Add(self.rfid_status, pos=(vpos,0), span=(0,3), flag=wx.LEFT, border=wSpace)
         vpos+=1
+        # RFID toggle (always autostarts on launch, but allows user to stop/restart)
+        self.rfid_toggle = wx.ToggleButton(self.widget_panel, id=wx.ID_ANY, label='RFID On/Off')
+        wSpacer.Add(self.rfid_toggle, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.rfid_toggle.Bind(wx.EVT_TOGGLEBUTTON, self._on_rfid_toggle)
+        vpos+=1
 
         start_text = wx.StaticText(self.widget_panel, label='Stim on:')
         wSpacer.Add(start_text, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
@@ -569,6 +574,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.onOpenSoftMouseConfig, self.menu_softmouse_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenRFIDConfig, self.menu_rfid_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenSessionHistory, self.menu_session_history)
+        # After user list (and config) populated, attempt automatic RFID start
+        wx.CallAfter(self._start_rfid_listener)
 
     # ---------------- Dialog open handlers (stubs) ----------------
     def onOpenSoftMouseConfig(self, event):
@@ -931,32 +938,45 @@ class MainFrame(wx.Frame):
             self.statusbar.SetStatusText(f'Animals parse error: {e}')
             self.log.exception('Failed parsing animals file: %s', e)
 
-    # ---------------- RFID listener integration -----------------
-    def toggleRFIDListener(self, event):
-        if self.rfid_toggle.GetValue():
-            self._start_rfid_listener()
-        else:
-            self._stop_rfid_listener()
-
     def _start_rfid_listener(self):
+        try:
+            self.log.info('Attempting RFID listener start')
+        except Exception:
+            pass
         if getattr(self, 'rfid_listening', False):
             return
-        if not hasattr(self, 'animal_metadata'):
-            self.statusbar.SetStatusText('Load animals before starting RFID listener')
-            self.rfid_toggle.SetValue(False)
+        port = (getattr(self, '_rfid_port_value', '') or '').strip()
+        if not port:
+            # Inform user; keep toggle off
+            try:
+                self.statusbar.SetStatusText('RFID: no port configured')
+                self.log.warning('RFID start aborted (no configured port)')
+            except Exception:
+                pass
+            if hasattr(self, 'rfid_toggle'):
+                try:
+                    self.rfid_toggle.SetValue(False)
+                except Exception:
+                    pass
             return
+        try:
+            baud = int(getattr(self, '_rfid_baud_value', 9600))
+        except Exception:
+            baud = 9600
+        if not hasattr(self, 'animal_metadata'):
+            try:
+                self.log.info('RFID starting without animals metadata loaded yet')
+            except Exception:
+                pass
         try:
             import multiprocessing as mp
             from rfid.rfid_listener_process import run_rfid_listener
         except Exception as e:
-            self.statusbar.SetStatusText(f'RFID module import error: {e}')
-            self.rfid_toggle.SetValue(False)
-            return
-        port = self.rfid_port.GetValue().strip()
-        baud = int(self.rfid_baud.GetValue())
-        if not port:
-            self.statusbar.SetStatusText('Enter COM port for RFID')
-            self.rfid_toggle.SetValue(False)
+            try:
+                self.statusbar.SetStatusText(f'RFID import error: {e}')
+                self.log.error('RFID module import error: %s', e)
+            except Exception:
+                pass
             return
         self.rfid_queue = mp.Queue()
         self.rfid_stop = mp.Event()
@@ -965,7 +985,6 @@ class MainFrame(wx.Frame):
             self.rfid_proc.start()
         except Exception as e:
             self.statusbar.SetStatusText(f'RFID start error: {e}')
-            self.rfid_toggle.SetValue(False)
             return
         self.rfid_listening = True
         self.rfid_status.SetLabel('RFID listening...')
@@ -975,7 +994,15 @@ class MainFrame(wx.Frame):
         if not self.backgroundTimer.IsRunning():
             self.backgroundTimer.Start(500)
         self.statusbar.SetStatusText('RFID listener started')
-        self.log.info('RFID listener started port=%s baud=%s', port, baud)
+        try:
+            self.log.info('RFID listener started port=%s baud=%s', port, baud)
+        except Exception:
+            pass
+        if hasattr(self, 'rfid_toggle'):
+            try:
+                self.rfid_toggle.SetValue(True)
+            except Exception:
+                pass
 
     def _stop_rfid_listener(self):
         if not getattr(self, 'rfid_listening', False):
@@ -991,74 +1018,21 @@ class MainFrame(wx.Frame):
             pass
         self.rfid_listening = False
         self.rfid_status.SetLabel('RFID idle')
-        self.rfid_toggle.SetValue(False)
         self.statusbar.SetStatusText('RFID listener stopped')
         self.log.info('RFID listener stopped')
+        if hasattr(self, 'rfid_toggle'):
+            try:
+                self.rfid_toggle.SetValue(False)
+            except Exception:
+                pass
 
-    # --- New: automatic RFID listener start based on user config flags ---
-    def _auto_start_rfid_if_configured(self):
-        """Start RFID listener automatically after acquisition init if user config enables it.
+    def _on_rfid_toggle(self, event):
+        # User-driven toggle
+        if self.rfid_toggle.GetValue():
+            self._start_rfid_listener()
+        else:
+            self._stop_rfid_listener()
 
-        Conditions:
-          - Not already listening
-          - _rfid_port_value is non-empty
-          - _rfid_autostart is True (default False if absent)
-        Falls back gracefully if any dependency (module import, process spawn) fails.
-        """
-        try:
-            if getattr(self, 'rfid_listening', False):
-                return
-            # Require autostart flag
-            if not bool(getattr(self, '_rfid_autostart', False)):
-                return
-            port = (getattr(self, '_rfid_port_value', '') or '').strip()
-            if not port:
-                self.log.info('RFID autostart skipped (no configured port)')
-                return
-            try:
-                baud = int(getattr(self, '_rfid_baud_value', 9600))
-            except Exception:
-                baud = 9600
-            # Import listener target
-            try:
-                from rfid.rfid_listener_process import run_rfid_listener  # noqa: E402
-            except Exception as e:
-                self.log.warning('RFID autostart import failed: %s', e)
-                return
-            self.rfid_queue = mp.Queue()
-            self.rfid_stop = mp.Event()
-            self.rfid_proc = mp.Process(target=run_rfid_listener, args=(port, baud, self.rfid_queue, self.rfid_stop), daemon=True)
-            try:
-                self.rfid_proc.start()
-            except Exception as e:
-                self.log.warning('RFID autostart process start failed: %s', e)
-                return
-            self.rfid_listening = True
-            # Update status label if it exists
-            try:
-                if hasattr(self, 'rfid_status'):
-                    self.rfid_status.SetLabel('RFID listening...')
-            except Exception:
-                pass
-            # Ensure background polling timer running
-            if not hasattr(self, 'backgroundTimer'):
-                self.backgroundTimer = wx.Timer(self)
-                self.Bind(wx.EVT_TIMER, self.pollBackground, self.backgroundTimer)
-            if not self.backgroundTimer.IsRunning():
-                self.backgroundTimer.Start(500)
-            self.statusbar.SetStatusText('RFID listener auto-started')
-            self.log.info('RFID listener auto-started port=%s baud=%s', port, baud)
-            # Reflect toggle button state if present
-            try:
-                if hasattr(self, 'rfid_toggle'):
-                    self.rfid_toggle.SetValue(True)
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                self.log.warning('RFID autostart encountered error: %s', e)
-            except Exception:
-                pass
 
     def _populate_from_last_session(self, rfid: str):
         self._ensure_local_db()
@@ -1617,22 +1591,10 @@ class MainFrame(wx.Frame):
             self.stopAq()
             time.sleep(2)
             self.play.SetLabel('Live')
-        if self._rfid_autostart and hasattr(self, 'animal_metadata') and not getattr(self, 'rfid_listening', False):
-            try:
-                # Mirror to legacy widgets if present
-                if hasattr(self, 'rfid_port') and isinstance(self.rfid_port, wx.TextCtrl):
-                    self.rfid_port.SetValue(self._rfid_port_value)
-                if hasattr(self, 'rfid_baud'):
-                    try:
-                        self.rfid_baud.SetValue(str(self._rfid_baud_value))
-                    except Exception:
-                        pass
-                self._start_rfid_listener()
-            except Exception:
-                pass
-            self.rec.Enable(True)
-            for h in self.disable4cam:
-                h.Enable(True)
+
+        self.rec.Enable(True)
+        for h in self.disable4cam:
+            h.Enable(True)
         # Live-only prerecord (start) logic
         if self.play.GetValue() and hasattr(self, 'save_to_db') and self.save_to_db.GetValue():
             if getattr(self, 'mouse_meta', None) and not getattr(self, '_live_only_active', False):
@@ -2455,7 +2417,8 @@ class MainFrame(wx.Frame):
             
             self.Enable(True)
             # Attempt automatic RFID listener start (even in simulation mode) after successful GUI init
-            self._auto_start_rfid_if_configured()
+            self.log.info('Starting RFID listener (if configured)')
+            self._start_rfid_listener()
             self.figure.canvas.draw()
         else:
             if not self.com.value < 0:

@@ -8,6 +8,7 @@ W Williamson, wallace.williamson@ucdenver.edu
 
 from __future__ import print_function
 from multiprocessing import Array, Queue, Value
+import multiprocessing as mp  # for spawning background processes (RFID, export) outside existing imports
 import wx
 import wx.lib.dialogs
 import os
@@ -25,6 +26,7 @@ import shutil
 from pathlib import Path
 import ruamel.yaml
 import winsound
+import queue
 
 # --- Path bootstrap to allow running this script from nested acquisition/ folder ---
 import pathlib, sys as _sys
@@ -90,8 +92,14 @@ class WidgetPanel(wx.Panel):
         wx.Panel.__init__(self, parent, -1,style=wx.SUNKEN_BORDER)
 
 class MainFrame(wx.Frame):
-    """Contains the main GUI and button boxes"""
-    def __init__(self, parent):
+    """Contains the main GUI and button boxes.
+
+    Parameters
+    ----------
+    simulate : bool
+        Start directly in simulation (no hardware) mode; useful with --simulate flag.
+    """
+    def __init__(self, parent, simulate: bool=False):
         
 # Settting the GUI size and panels design
         displays = (wx.Display(i) for i in range(wx.Display.GetCount())) # Gets the number of displays
@@ -127,6 +135,10 @@ class MainFrame(wx.Frame):
         self.statusbar.SetStatusText("")
         self.log = get_logger('gui')
         self.log.info('GUI MainFrame initialized')
+        # Simulation mode: set True when camera hardware init fails so GUI can still be exercised
+        self.simulate_mode = bool(simulate)
+        # Collect initialization / hardware errors for later user inspection
+        self.init_errors = []
 
         self.SetSizeHints(wx.Size(self.gui_size)) #  This sets the minimum size of the GUI. It can scale now!
         
@@ -397,6 +409,16 @@ class MainFrame(wx.Frame):
         vpos+=1
         start_text = wx.StaticText(self.widget_panel, label='Inspect values within ROIs:')
         wSpacer.Add(start_text, pos=(vpos,0), span=(0,3), flag=wx.LEFT, border=wSpace)
+        # Add three inspection toggles (pellet intensity, hand ROI, stim ROI)
+        vpos+=1
+        self.inspect_pellet = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label='Pellet')
+        wSpacer.Add(self.inspect_pellet, pos=(vpos,0), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.inspect_hand = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label='Hand')
+        wSpacer.Add(self.inspect_hand, pos=(vpos,1), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.inspect_stim = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label='Stim')
+        wSpacer.Add(self.inspect_stim, pos=(vpos,2), span=(0,1), flag=wx.LEFT, border=wSpace)
+        # Stim inspection disabled until init reveals a stim camera (enabled later)
+        self.inspect_stim.Enable(False)
         
         # --- New: Save to Database checkbox ---
         vpos+=1
@@ -418,6 +440,12 @@ class MainFrame(wx.Frame):
         self.quit.Bind(wx.EVT_BUTTON, self.quitButton)
         self.Bind(wx.EVT_CLOSE, self.quitButton)
 
+        # Hardware status / help button (added near Quit/compress)
+        vpos_help = vpos  # row index for HW Status
+        self.hw_status_btn = wx.Button(self.widget_panel, id=wx.ID_ANY, label="HW Status")
+        wSpacer.Add(self.hw_status_btn, pos=(vpos_help,1), span=(0,1), flag=wx.LEFT, border=wSpace)
+        self.hw_status_btn.Bind(wx.EVT_BUTTON, self.showHardwareStatus)
+
         self.widget_panel.SetSizer(wSpacer)
         wSpacer.Fit(self.widget_panel)
         self.widget_panel.Layout()
@@ -433,6 +461,9 @@ class MainFrame(wx.Frame):
         
         self.figure,self.axes,self.canvas = self.image_panel.getfigure()
         self.figure.canvas.draw()
+        # If simulation requested immediately, draw overlay now
+        if self.simulate_mode:
+            self._add_simulation_overlays(initial=True)
 
         self.pellet_x = self.system_cfg['pelletXY'][0]
         self.pellet_y = self.system_cfg['pelletXY'][1]
@@ -1789,6 +1820,20 @@ class MainFrame(wx.Frame):
             
         if self.camaq.value == 2:
             return
+        # In simulation mode, synthesize dummy frames so GUI updates
+        if self.simulate_mode:
+            try:
+                for ndx, im in enumerate(self.im):
+                    # Create a simple gradient pattern that changes with time
+                    t = int(time.time()*5) % 255
+                    if ndx >= len(self.frame):
+                        continue
+                    self.frame[ndx][:] = (np.arange(self.frame[ndx].shape[0])[:,None] + np.arange(self.frame[ndx].shape[1])[None,:] + t) % 255
+                    im.set_data(self.frame[ndx])
+                self.figure.canvas.draw()
+            except Exception:
+                pass
+            return
         for ndx, im in enumerate(self.im):
             if self.frmGrab[ndx].value == 1:
                 self.frameBuff[ndx][0:] = np.frombuffer(self.array4feed[ndx].get_obj(), self.dtype, self.size)
@@ -2147,48 +2192,105 @@ class MainFrame(wx.Frame):
                 h.Enable(True)
     
     def initThreads(self):
-        self.camq = dict()
-        self.camq_p2read = dict()
-        self.cam = list()
-        for ndx, camID in enumerate(self.camIDlsit):
-            self.camq[camID] = Queue()
-            self.camq_p2read[camID] = Queue()
-            self.cam.append(spin.multiCam_DLC_Cam(self.camq[camID], self.camq_p2read[camID],
-                                               camID, self.camIDlsit,
-                                               self.frmDims, self.camaq,
-                                               self.frmaq, self.array4feed[ndx], self.frmGrab[ndx],
-                                               self.com, self.stim_status))
-            self.cam[ndx].start()
-            
-        for m in self.mlist:
-            self.camq[m].put('InitM')
-            self.camq_p2read[m].get()
-        for s in self.slist:
-            self.camq[s].put('InitS')
-            self.camq_p2read[s].get()
-        
-        self.ardq = Queue()
-        self.ardq_p2read = Queue()
-        self.ard = arduino.arduinoCtrl(self.ardq, self.ardq_p2read, self.frmaq, self.com,
-                                       self.is_busy, self.mVal, self.stim_status, self.stim_selection, self.del_style)
-        self.ard.start()
-        self.ardq_p2read.get()
+        if self.simulate_mode:
+            # Already in simulation; nothing to init
+            return True
+        try:
+            self.camq = dict()
+            self.camq_p2read = dict()
+            self.cam = list()
+            for ndx, camID in enumerate(self.camIDlsit):
+                self.camq[camID] = Queue()
+                self.camq_p2read[camID] = Queue()
+                self.cam.append(spin.multiCam_DLC_Cam(self.camq[camID], self.camq_p2read[camID],
+                                                   camID, self.camIDlsit,
+                                                   self.frmDims, self.camaq,
+                                                   self.frmaq, self.array4feed[ndx], self.frmGrab[ndx],
+                                                   self.com, self.stim_status))
+                self.cam[ndx].start()
+            # Initialize master then slaves; use timeouts to avoid blocking forever
+            for m in self.mlist:
+                try:
+                    self.camq[m].put('InitM')
+                    self.camq_p2read[m].get(timeout=5)
+                except Exception:
+                    raise RuntimeError(f'Camera init (master {m}) failed')
+            for s in self.slist:
+                try:
+                    self.camq[s].put('InitS')
+                    self.camq_p2read[s].get(timeout=5)
+                except Exception:
+                    raise RuntimeError(f'Camera init (slave {s}) failed')
+            # Arduino thread (optional)
+            self.ardq = Queue()
+            self.ardq_p2read = Queue()
+            self.ard = arduino.arduinoCtrl(self.ardq, self.ardq_p2read, self.frmaq, self.com,
+                                           self.is_busy, self.mVal, self.stim_status, self.stim_selection, self.del_style)
+            self.ard.start()
+            try:
+                self.ardq_p2read.get(timeout=5)
+            except Exception:
+                self.log.warning('Arduino init timeout; continuing without Arduino')
+                self.com.value = -1
+            return True
+        except Exception as e:
+            # Fallback to simulation mode
+            try:
+                self.log.warning('Camera initialization failed (%s); enabling simulation mode', e)
+            except Exception:
+                pass
+            try:
+                self.init_errors.append(f'Camera init failure: {e}')
+            except Exception:
+                pass
+            self.simulate_mode = True
+            # Clean up any partially started processes
+            try:
+                for proc in getattr(self, 'cam', []):
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Ensure Arduino disabled
+            self.com.value = -1
+            return False
         
     def deinitThreads(self):
-        for n, camID in enumerate(self.camIDlsit):
-            self.camq[camID].put('Release')
-            self.camq_p2read[camID].get()
-            self.camq[camID].close()
-            self.camq_p2read[camID].close()
-            self.cam[n].terminate()
-        if self.com.value >= 0:
-            self.ardq.put('Release')
-            self.ardq_p2read.get()
-            self.ardq.close()
-            self.ardq_p2read.close()
-            self.ard.terminate()
+        if self.simulate_mode:
+            return
+        try:
+            for n, camID in enumerate(self.camIDlsit):
+                self.camq[camID].put('Release')
+                try:
+                    self.camq_p2read[camID].get(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    self.camq[camID].close(); self.camq_p2read[camID].close()
+                except Exception:
+                    pass
+                try:
+                    self.cam[n].terminate()
+                except Exception:
+                    pass
+            if self.com.value >= 0:
+                try:
+                    self.ardq.put('Release')
+                    self.ardq_p2read.get(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    self.ardq.close(); self.ardq_p2read.close(); self.ard.terminate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
             
     def startAq(self):
+        if self.simulate_mode:
+            return
         for m in self.mlist:
             self.camq[m].put('Start')
         for s in self.slist:
@@ -2197,72 +2299,82 @@ class MainFrame(wx.Frame):
             self.camq[m].put('TrigOff')
         
     def stopAq(self):
-        
+        if self.simulate_mode:
+            self.camaq.value = 0
+            return
         self.camaq.value = 0
         for s in self.slist:
             self.camq[s].put('Stop')
-            self.camq_p2read[s].get()
+            try:
+                self.camq_p2read[s].get(timeout=3)
+            except Exception:
+                pass
         for m in self.mlist:
             self.camq[m].put('Stop')
-            self.camq_p2read[m].get()
+            try:
+                self.camq_p2read[m].get(timeout=3)
+            except Exception:
+                pass
         
     def updateSettings(self, event):
         self.system_cfg = clara.read_config()
+        # Simulation: fabricate camera settings
+        if self.simulate_mode:
+            self.aqW = [self.frmDims[3]] * len(self.camIDlsit)
+            self.aqH = [self.frmDims[1]] * len(self.camIDlsit)
+            self.recSet = [30] * len(self.camIDlsit)
+            print('Simulation mode: using dummy camera settings (30fps)')
+            # Ensure overlays exist
+            self._add_simulation_overlays()
+            return
         self.aqW = list()
         self.aqH = list()
         self.recSet = list()
         for n, camID in enumerate(self.camIDlsit):
             try:
                 self.camq[camID].put('updateSettings')
-                self.camq_p2read[camID].get(timeout=1)
+                self.camq_p2read[camID].get(timeout=2)
                 if self.auto_stim.GetValue():
                     self.camq[camID].put('roi')
                 elif self.crop.GetValue():
                     self.camq[camID].put('crop')
                 else:
                     self.camq[camID].put('full')
-            
-                self.recSet.append(self.camq_p2read[camID].get(timeout=4))
-                aqW = self.camq_p2read[camID].get(timeout=1)
+                self.recSet.append(self.camq_p2read[camID].get(timeout=5))
+                aqW = self.camq_p2read[camID].get(timeout=2)
                 self.aqW.append(int(aqW))
-                aqH = self.camq_p2read[camID].get(timeout=1)
+                aqH = self.camq_p2read[camID].get(timeout=2)
                 self.aqH.append(int(aqH))
-                
-            except:
-                print('\nTrying to fix.  Please wait...\n')
-                self.deinitThreads()
-                self.camReset(event)
-                self.initThreads()
-                self.camq[camID].put('updateSettings')
-                self.camq_p2read[camID].get()
-                if self.auto_stim.GetValue():
-                    self.camq[camID].put('roi')
-                elif self.crop.GetValue():
-                    self.camq[camID].put('crop')
-                else:
-                    self.camq[camID].put('full')
-            
-                self.recSet.append(self.camq_p2read[camID].get())
-                aqW = self.camq_p2read[camID].get()
-                self.aqW.append(int(aqW))
-                aqH = self.camq_p2read[camID].get()
-                self.aqH.append(int(aqH))
+            except Exception as e:
+                print('\nCamera settings update failed (%s). Enabling simulation mode.\n' % e)
+                try:
+                    self.init_errors.append(f'updateSettings failure cam {camID}: {e}')
+                except Exception:
+                    pass
+                self.simulate_mode = True
+                self.aqW = [self.frmDims[3]] * len(self.camIDlsit)
+                self.aqH = [self.frmDims[1]] * len(self.camIDlsit)
+                self.recSet = [30] * len(self.camIDlsit)
+                self._add_simulation_overlays()
+                break
             print('frame rate ' + self.camStrList[n] + ' : ' + str(round(self.recSet[n])))
                 
     def initCams(self, event):
         if self.init.GetValue() == True:
             self.Enable(False)
-            
-            self.initThreads()
+            success = self.initThreads()
+            if not success:
+                self.simulate_mode = True
             self.updateSettings(event)
             
             self.Bind(wx.EVT_TIMER, self.vidPlayer, self.liveTimer)
             
             self.camaq.value = 1
-            self.startAq()
-            time.sleep(1)
-            self.camaq.value = 0
-            self.stopAq()
+            if not self.simulate_mode:
+                self.startAq()
+                time.sleep(1)
+                self.camaq.value = 0
+                self.stopAq()
             self.x1 = list()
             self.x2 = list()
             self.y1 = list()
@@ -2272,7 +2384,8 @@ class MainFrame(wx.Frame):
             self.dispSize = list()
             for ndx, im in enumerate(self.im):
                 self.frame[ndx] = np.zeros(self.shape, dtype='ubyte')
-                self.frameBuff[ndx][0:] = np.frombuffer(self.array4feed[ndx].get_obj(), self.dtype, self.size)
+                if not self.simulate_mode:
+                    self.frameBuff[ndx][0:] = np.frombuffer(self.array4feed[ndx].get_obj(), self.dtype, self.size)
                 if self.auto_stim.GetValue() and self.stimAxes == self.axes[ndx]:
                     self.h.append(self.stimroi[3])
                     self.w.append(self.stimroi[1])
@@ -2301,9 +2414,26 @@ class MainFrame(wx.Frame):
                 self.dispSize.append(self.aqH[ndx]*self.aqW[ndx])
                 self.y2.append(self.y1[ndx]+self.aqH[ndx])
                 self.x2.append(self.x1[ndx]+self.aqW[ndx])
-                
-                frame = self.frameBuff[ndx][0:self.dispSize[ndx]].reshape([self.aqH[ndx], self.aqW[ndx]])
-                self.frame[ndx][self.y1[ndx]:self.y2[ndx],self.x1[ndx]:self.x2[ndx]] = frame
+                # Populate initial image data
+                if self.simulate_mode:
+                    # Draw a gradient frame; then copy only the valid intersection into ROI area.
+                    sim_frame = np.add.outer(np.arange(self.aqH[ndx])%255,
+                                             np.arange(self.aqW[ndx])%255).astype('uint8')
+                    y1, y2 = self.y1[ndx], self.y2[ndx]
+                    x1, x2 = self.x1[ndx], self.x2[ndx]
+                    maxH, maxW = self.frame[ndx].shape
+                    # Clip to actual frame bounds (important when ROI origin + aq dims extend past edge)
+                    if y2 > maxH:
+                        y2 = maxH
+                    if x2 > maxW:
+                        x2 = maxW
+                    eff_h = max(0, y2 - y1)
+                    eff_w = max(0, x2 - x1)
+                    if eff_h > 0 and eff_w > 0:
+                        self.frame[ndx][y1:y2, x1:x2] = sim_frame[:eff_h, :eff_w]
+                else:
+                    frame = self.frameBuff[ndx][0:self.dispSize[ndx]].reshape([self.aqH[ndx], self.aqW[ndx]])
+                    self.frame[ndx][self.y1[ndx]:self.y2[ndx],self.x1[ndx]:self.x2[ndx]] = frame
                 im.set_data(self.frame[ndx])
                 
                     
@@ -2324,11 +2454,14 @@ class MainFrame(wx.Frame):
             self.crop.Enable(False)
             self.auto_stim.Enable(False)
             self.auto_pellet.Enable(True)
+            if self.simulate_mode:
+                self.statusbar.SetStatusText('Simulation mode (hardware not initialized)')
+                self._add_simulation_overlays()
             
             for h in self.onWhenCamEnabled:
                 h.Enable(True)
             
-            if not self.com.value < 0:
+            if (not self.com.value < 0) and (not self.simulate_mode):
                 if self.auto_delay.GetValue():
                     self.make_delay_iters()
                 self.setProtocol(None)
@@ -2392,7 +2525,50 @@ class MainFrame(wx.Frame):
             for h in self.onWhenCamEnabled:
                 h.Enable(False)
             
-            self.deinitThreads()
+            if not self.simulate_mode:
+                self.deinitThreads()
+            # Stop RFID listener when releasing acquisition resources
+            try:
+                if getattr(self, 'rfid_listening', False):
+                    self._stop_rfid_listener()
+            except Exception:
+                pass
+
+    def _add_simulation_overlays(self, initial: bool=False):
+        """Overlay SIM MODE label on each camera axes (idempotent)."""
+        if not hasattr(self, 'axes'):
+            return
+        try:
+            if not hasattr(self, '_sim_overlay_artists'):
+                self._sim_overlay_artists = []
+            if self._sim_overlay_artists:
+                # already added
+                return
+            for ax in self.axes:
+                txt = ax.text(0.5, 0.5, 'SIMULATION\nMODE', color='red', fontsize=22,
+                              ha='center', va='center', alpha=0.35, transform=ax.transAxes,
+                              fontweight='bold')
+                self._sim_overlay_artists.append(txt)
+            self.figure.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def showHardwareStatus(self, event):
+        """Popup summarizing hardware state and troubleshooting tips."""
+        sim = 'ENABLED' if self.simulate_mode else 'OFF'
+        tips = [
+            'Check camera USB/PCIe connections and power.',
+            'Verify PySpin SDK installed and matches camera driver.',
+            'Close other apps using the cameras.',
+            'Confirm systemdata.yaml serial numbers match actual cameras.',
+            'Arduino: check correct COM port in systemdata.yaml (key COM).',
+            'Run with --simulate to bypass hardware while testing GUI.'
+        ]
+        err_lines = '\n'.join(self.init_errors[-10:]) if self.init_errors else 'None recorded.'
+        msg = f'Hardware Status:\n  Simulation: {sim}\n  Cameras: {len(getattr(self, "camStrList", []))} configured\n  Arduino COM active: {"Yes" if self.com.value >= 0 and not self.simulate_mode else "No"}\n\nRecent init errors:\n{err_lines}\n\nTroubleshooting tips:\n - ' + '\n - '.join(tips)
+        dlg = wx.MessageDialog(self, msg, 'Hardware Status', style=wx.OK|wx.ICON_INFORMATION)
+        dlg.ShowModal()
+        dlg.Destroy()
         
     def quitButton(self, event):
         """
@@ -2446,13 +2622,19 @@ class MainFrame(wx.Frame):
         self.statusbar.SetStatusText("")
         self.Destroy()
     
-def show():
+def show(argv=None):
+    """Launch GUI. Optional argv for testability."""
+    import argparse, sys as _sys
+    if argv is None:
+        argv = _sys.argv[1:]
+    parser = argparse.ArgumentParser(description='RT Video Acquisition GUI')
+    parser.add_argument('--simulate', action='store_true', help='Start in simulation mode (no hardware access)')
+    args, _unknown = parser.parse_known_args(argv)
     app = wx.App()
-    MainFrame(None).Show()
+    MainFrame(None, simulate=args.simulate).Show()
     app.MainLoop()
 
 if __name__ == '__main__':
-    
     show()
 
 # ---------------- New Dialog Classes (Pre/Post Recording) -----------------

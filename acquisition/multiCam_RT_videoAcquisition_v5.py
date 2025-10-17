@@ -216,18 +216,22 @@ class MainFrame(wx.Frame):
         self.rec.Enable(False)
         # Test mode checkbox: skip dialogs & DB/file writes when engaged
         self.test_mode = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Test")
-        camsizer.Add(self.test_mode, pos=(vpos,6), span=(1,2), flag=wx.LEFT, border=wSpace)
+        # Place test_mode at col 6 (single cell span)
+        camsizer.Add(self.test_mode, pos=(vpos,6), span=(1,1), flag=wx.LEFT, border=wSpace)
         self.test_mode.SetValue(False)
-        
+
+        # Recording duration (minutes)
         self.minRec = wx.SpinCtrl(self.widget_panel, value='20', size=(50, -1))
         self.minRec.Enable(False)
         min_text = wx.StaticText(self.widget_panel, label='M:')
-        camsizer.Add(self.minRec, pos=(vpos,7), span=(1,2), flag=wx.ALL, border=wSpace)
-        camsizer.Add(min_text, pos=(vpos,6), span=(1,1), flag=wx.TOP, border=5)
+        # Place label at col 7, spin control at col 8 spanning two columns to give a bit more room
+        camsizer.Add(min_text, pos=(vpos,7), span=(1,1), flag=wx.TOP, border=5)
+        camsizer.Add(self.minRec, pos=(vpos,8), span=(1,2), flag=wx.ALL, border=wSpace)
         self.minRec.SetMax(300)
-        
+
         self.set_stim = wx.ToggleButton(self.widget_panel, id=wx.ID_ANY, label="Stim ROI", size=(bw, -1))
-        camsizer.Add(self.set_stim, pos=(vpos,9), span=(0,3), flag=wx.TOP, border=0)
+        # Move stim ROI control to col 10 with proper (row,col) span >=1
+        camsizer.Add(self.set_stim, pos=(vpos,10), span=(1,3), flag=wx.TOP, border=0)
         self.set_stim.Bind(wx.EVT_TOGGLEBUTTON, self.setCrop)
         self.set_stim.Enable(False)
         

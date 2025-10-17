@@ -1624,7 +1624,20 @@ class MainFrame(wx.Frame):
             self.recordCam(event)
             
             if wx.MessageBox("Are you sure?", caption="Abort", style=wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION):
-                shutil.rmtree(self.sess_dir)
+                # Mark abort to prevent DB finalize
+                self._abort_recording = True
+                # Remove session directory (cleanup) if it exists
+                try:
+                    if hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
+                        shutil.rmtree(self.sess_dir)
+                except Exception:
+                    pass
+                # If a DB session was started, clear active ID to skip finalize
+                try:
+                    if hasattr(self, '_active_session_id'):
+                        self._active_session_id = None
+                except Exception:
+                    pass
                 time.sleep(5)
             self.play.SetValue(False)
                         
@@ -1885,6 +1898,8 @@ class MainFrame(wx.Frame):
         
     def recordCam(self, event):
         if self.rec.GetValue():
+            # Reset abort flag at the start of a new recording attempt
+            self._abort_recording = False
             # Stop RFID listener for duration of recording
             try:
                 if getattr(self, 'rfid_listening', False):
@@ -1960,6 +1975,9 @@ class MainFrame(wx.Frame):
                         maxSess = sessNum
             file_count = maxSess+1
             sess_string = '%s%03d' % ('session', file_count)
+            # Build session reference string for database snapshot exports
+            session_ref = f"date_{self.system_cfg['unitRef']}_{sess_string}"  # e.g. date_UNIT123_session001
+            self.session_ref = session_ref  # retain for finalize/export usage
             self.sess_dir = os.path.join(base_dir, sess_string)
             if not os.path.exists(self.sess_dir):
                 os.makedirs(self.sess_dir)
@@ -1985,7 +2003,7 @@ class MainFrame(wx.Frame):
             shutil.copyfile(sysconfigname,os.path.join(self.sess_dir,syscopyname))
             # Update DB session paths now that they are known
             try:
-                if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
+                if not getattr(self, '_abort_recording', False) and self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
                     self._update_db_session_paths(self.sess_dir, self.metapath)
             except Exception:
                 pass
@@ -2024,12 +2042,12 @@ class MainFrame(wx.Frame):
             self.rec.SetLabel('Stop')
             self.play.SetLabel('Abort')
             if getattr(self, 'mouse_meta', None):
-                self.log.info('Recording started session_dir=%s rfid=%s', self.sess_dir, self.mouse_meta.get('rfid'))
+                self.log.info('Recording started session_dir=%s rfid=%s session_ref=%s', self.sess_dir, self.mouse_meta.get('rfid'), getattr(self, 'session_ref', None))
             else:
-                self.log.info('Recording started session_dir=%s no RFID metadata', self.sess_dir)
+                self.log.info('Recording started session_dir=%s no RFID metadata session_ref=%s', self.sess_dir, getattr(self, 'session_ref', None))
             # Write metalink entry if RFID metadata present
             try:
-                if getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
+                if not getattr(self, '_abort_recording', False) and getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
                     self.write_metalink_entry()
             except Exception as e:
                 self.log.exception('Failed to write metalink entry: %s', e)
@@ -2051,8 +2069,11 @@ class MainFrame(wx.Frame):
                         self.meta['RFID'] = self.mouse_meta['rfid']
                 except Exception as e:
                     print(f'Failed to attach mouse metadata: {e}')
+            # Attach session_ref into metadata file
+            if getattr(self, 'session_ref', None):
+                self.meta['session_ref'] = self.session_ref
             clara.write_metadata(self.meta, self.metapath)
-            self.log.info('Recording stopped session_dir=%s metadata_written=%s', self.sess_dir, self.metapath)
+            self.log.info('Recording stopped session_dir=%s metadata_written=%s session_ref=%s', self.sess_dir, self.metapath, getattr(self, 'session_ref', None))
             # Restart RFID listener after recording (if not in live mode)
             try:
                 if not self.play.GetValue():
@@ -2139,13 +2160,14 @@ class MainFrame(wx.Frame):
                         'environment': env_info,
                         'video_files': video_files,
                         'stim_events': stim_events,
+                        'session_ref': getattr(self, 'session_ref', None),
                     }
                     jf = _pl.Path(self.sess_dir) / 'session_notes.json'
                     with jf.open('w', encoding='utf-8') as fh:
                         json.dump(merged, fh, indent=2)
                     # Finalize DB session now (if enabled)
                     try:
-                        if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
+                        if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None) and not getattr(self, '_abort_recording', False):
                             self._finalize_db_session(post_context, session_notes=merged)
                     except Exception:
                         pass

@@ -118,51 +118,65 @@ class ExperimentDB:
             pass
 
     def _export_snapshots(self):
-        """Write CSV and (if pandas available) XLSX snapshots of mice and sessions tables.
+        """Export snapshots where each session is a single row containing mouse + session columns.
 
-        Creates mice.csv, sessions.csv, mice.xlsx, sessions.xlsx in root_dir and mirror_dir (if set).
-        Failures are silent (to avoid interrupting acquisition flow).
+        - CSV: sessions_with_mouse.csv where header combines mouse columns then session columns.
+          One row per session; mouse columns duplicated for each session.
+          If a mouse has NO sessions yet, it is omitted (or could be added with empty session fields later).
+        - XLSX: mice_sessions.xlsx with one sheet per mouse RFID; sheet header is combined
+          (mouse + session) and each row is a session with mouse data prefixed.
+        Silent on failure to avoid interrupting acquisition.
         """
         try:
-            import csv
-            import sqlite3
-            # Extract rows
+            import sqlite3, csv
             with self._lock, sqlite3.connect(self.db_path) as cx:
                 mice_rows = list(cx.execute('SELECT rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc FROM mice'))
                 session_rows = list(cx.execute('SELECT id,rfid,start_utc,stop_utc,prerecord,postrecord,session_notes,metadata_yaml_path,session_dir,was_live_only,synced,created_utc,updated_utc FROM sessions'))
-            mice_header = ['rfid','last_softmouse_pull','softmouse_payload','created_utc','updated_utc']
-            session_header = ['id','rfid','start_utc','stop_utc','prerecord','postrecord','session_notes','metadata_yaml_path','session_dir','was_live_only','synced','created_utc','updated_utc']
+            mice_header = ['rfid','last_softmouse_pull','softmouse_payload','mouse_created_utc','mouse_updated_utc']
+            sess_header = ['session_id','start_utc','stop_utc','prerecord','postrecord','session_notes','metadata_yaml_path','session_dir','was_live_only','synced','session_created_utc','session_updated_utc']
+            # Map mice by RFID for quick join
+            mouse_map = {m[0]: m for m in mice_rows}
+            # Build joined session rows
+            joined_rows = []
+            for s in session_rows:
+                # s order: id, rfid, start_utc, stop_utc, prerecord, postrecord, session_notes, metadata_yaml_path, session_dir, was_live_only, synced, created_utc, updated_utc
+                m = mouse_map.get(s[1])
+                if not m:
+                    continue  # skip if mouse not found (should not happen)
+                joined = [
+                    m[0], m[1], m[2], m[3], m[4],  # mouse cols
+                    s[0], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]  # session cols excluding duplicate RFID (s[1])
+                ]
+                joined_rows.append(joined)
+            combined_header = mice_header + sess_header
             targets = [self.root_dir] + ([self.mirror_dir] if self.mirror_dir else [])
             for tgt in targets:
                 if not tgt:
                     continue
+                # CSV export
                 try:
-                    # CSV files
-                    with open(os.path.join(tgt, 'mice.csv'), 'w', newline='', encoding='utf-8') as fh:
+                    csv_path = os.path.join(tgt, 'sessions_with_mouse.csv')
+                    with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
                         w = csv.writer(fh)
-                        w.writerow(mice_header)
-                        w.writerows(mice_rows)
-                    with open(os.path.join(tgt, 'sessions.csv'), 'w', newline='', encoding='utf-8') as fh:
-                        w = csv.writer(fh)
-                        w.writerow(session_header)
-                        w.writerows(session_rows)
+                        w.writerow(combined_header)
+                        w.writerows(joined_rows)
                 except Exception:
                     pass
-            # XLSX (optional)
-            try:
-                import pandas as pd  # type: ignore
-                mice_df = pd.DataFrame(mice_rows, columns=mice_header)
-                sess_df = pd.DataFrame(session_rows, columns=session_header)
-                for tgt in targets:
-                    if not tgt:
-                        continue
-                    try:
-                        mice_df.to_excel(os.path.join(tgt, 'mice.xlsx'), index=False)
-                        sess_df.to_excel(os.path.join(tgt, 'sessions.xlsx'), index=False)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                # XLSX workbook per mouse
+                try:
+                    import pandas as pd  # type: ignore
+                    # Group joined rows by RFID (first column)
+                    per_mouse: dict[str, list[list]] = {}
+                    for row in joined_rows:
+                        per_mouse.setdefault(row[0], []).append(row)
+                    xlsx_path = os.path.join(tgt, 'mice_sessions.xlsx')
+                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:  # engine fallback automatic
+                        for rfid, rows in per_mouse.items():
+                            sheet_name = rfid[:31]
+                            df = pd.DataFrame(rows, columns=combined_header)
+                            df.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception:
+                    pass
         except Exception:
             pass
 

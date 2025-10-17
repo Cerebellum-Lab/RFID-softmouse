@@ -206,3 +206,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# YAML configuration and metadata (requested to ignore all .yaml/.yml)
+*.yaml
+*.yml

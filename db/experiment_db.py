@@ -57,6 +57,8 @@ class ExperimentDB:
         self._init_schema()
         # Initial mirror copy post schema init
         self._mirror_db()
+        # Initial export snapshots
+        self._export_snapshots()
 
     @classmethod
     def from_existing(cls, db_path: str, mirror_dir: str | None = None):
@@ -143,6 +145,69 @@ class ExperimentDB:
         except Exception:
             pass
 
+    def _export_snapshots(self):
+        """Export snapshots where each session is a single row containing mouse + session columns.
+
+        - CSV: sessions_with_mouse.csv where header combines mouse columns then session columns.
+          One row per session; mouse columns duplicated for each session.
+          If a mouse has NO sessions yet, it is omitted (or could be added with empty session fields later).
+        - XLSX: mice_sessions.xlsx with one sheet per mouse RFID; sheet header is combined
+          (mouse + session) and each row is a session with mouse data prefixed.
+        Silent on failure to avoid interrupting acquisition.
+        """
+        try:
+            import sqlite3, csv
+            with self._lock, sqlite3.connect(self.db_path) as cx:
+                mice_rows = list(cx.execute('SELECT rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc FROM mice'))
+                session_rows = list(cx.execute('SELECT id,rfid,start_utc,stop_utc,prerecord,postrecord,session_notes,metadata_yaml_path,session_dir,was_live_only,synced,created_utc,updated_utc FROM sessions'))
+            mice_header = ['rfid','last_softmouse_pull','softmouse_payload','mouse_created_utc','mouse_updated_utc']
+            sess_header = ['session_id','start_utc','stop_utc','prerecord','postrecord','session_notes','metadata_yaml_path','session_dir','was_live_only','synced','session_created_utc','session_updated_utc']
+            # Map mice by RFID for quick join
+            mouse_map = {m[0]: m for m in mice_rows}
+            # Build joined session rows
+            joined_rows = []
+            for s in session_rows:
+                # s order: id, rfid, start_utc, stop_utc, prerecord, postrecord, session_notes, metadata_yaml_path, session_dir, was_live_only, synced, created_utc, updated_utc
+                m = mouse_map.get(s[1])
+                if not m:
+                    continue  # skip if mouse not found (should not happen)
+                joined = [
+                    m[0], m[1], m[2], m[3], m[4],  # mouse cols
+                    s[0], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]  # session cols excluding duplicate RFID (s[1])
+                ]
+                joined_rows.append(joined)
+            combined_header = mice_header + sess_header
+            targets = [self.root_dir] + ([self.mirror_dir] if self.mirror_dir else [])
+            for tgt in targets:
+                if not tgt:
+                    continue
+                # CSV export
+                try:
+                    csv_path = os.path.join(tgt, 'sessions_with_mouse.csv')
+                    with open(csv_path, 'w', newline='', encoding='utf-8') as fh:
+                        w = csv.writer(fh)
+                        w.writerow(combined_header)
+                        w.writerows(joined_rows)
+                except Exception:
+                    pass
+                # XLSX workbook per mouse
+                try:
+                    import pandas as pd  # type: ignore
+                    # Group joined rows by RFID (first column)
+                    per_mouse: dict[str, list[list]] = {}
+                    for row in joined_rows:
+                        per_mouse.setdefault(row[0], []).append(row)
+                    xlsx_path = os.path.join(tgt, 'mice_sessions.xlsx')
+                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:  # engine fallback automatic
+                        for rfid, rows in per_mouse.items():
+                            sheet_name = rfid[:31]
+                            df = pd.DataFrame(rows, columns=combined_header)
+                            df.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ---------------- mice table ops ----------------
     def ensure_mouse(self, rfid: str, softmouse_payload: Optional[dict] = None):
         now = dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
@@ -154,6 +219,7 @@ class ExperimentDB:
             else:
                 cx.execute('INSERT INTO mice (rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc) VALUES (?,?,?,?,?)', (rfid, now, payload_txt, now, now))
         self._mirror_db()
+        self._export_snapshots()
 
     def get_mouse_softmouse_payload(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -175,6 +241,7 @@ class ExperimentDB:
                 sid, rfid, now, json.dumps(prerecord) if prerecord else None, 1 if was_live_only else 0, session_dir, metadata_yaml_path, now, now
             ))
         self._mirror_db()
+        self._export_snapshots()
         return sid
 
     def finalize_session(self, sid: str, postrecord: Optional[dict], session_notes: Optional[dict] = None):
@@ -184,6 +251,7 @@ class ExperimentDB:
                 now, json.dumps(postrecord) if postrecord else None, json.dumps(session_notes) if session_notes else None, now, sid
             ))
         self._mirror_db()
+        self._export_snapshots()
 
     def last_session_for_mouse(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -229,6 +297,7 @@ class ExperimentDB:
             qmarks = ','.join('?' for _ in ids)
             cx.execute(f'UPDATE sessions SET synced=1, updated_utc=? WHERE id IN ({qmarks})', [now, *ids])
         self._mirror_db()
+        self._export_snapshots()
 
     # -------------- history queries --------------
     def list_sessions_for_mouse(self, rfid: str, limit: int = 50) -> List[dict]:

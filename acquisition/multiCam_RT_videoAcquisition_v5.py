@@ -1128,11 +1128,19 @@ class MainFrame(wx.Frame):
             from db.experiment_db import ExperimentDB
             root = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
             root = os.path.abspath(root)
-            # Determine mirror path: default pattern Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs\<unitRef>
+            # Determine mirror path: platform-specific default pattern
             mirror_path = None
             try:
                 unit_ref = self.system_cfg.get('unitRef', 'UnitUnknown') if hasattr(self, 'system_cfg') else 'UnitUnknown'
-                default_mirror = os.path.join('Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs', unit_ref)
+                if os.name == 'nt':
+                    # Windows network drive (legacy)
+                    base_default = r'Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs'
+                else:
+                    # Linux / Isilon mount path
+                    base_default = '/mnt/isilon/Data/ReachingData/ExperimentLogs'
+                # Allow environment override (SOFTMOUSE_MIRROR_BASE)
+                base_default = os.environ.get('SOFTMOUSE_MIRROR_BASE', base_default)
+                default_mirror = os.path.join(base_default, unit_ref)
                 # If user config previously saved a custom mirror_dir, reuse it
                 saved_mirror = None
                 if hasattr(self, 'user_cfg') and isinstance(self.user_cfg, dict):

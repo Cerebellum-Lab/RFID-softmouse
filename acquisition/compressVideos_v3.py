@@ -62,9 +62,24 @@ class CLARA_compress(Process):
                         passtest = self.testVids(v,str(dest_path))
                         if not passtest:
                             env = os.environ.copy()
-                            env["PATH"] = r"C:\ffmpeg\bin;" + env["PATH"]
-                            command = 'ffmpeg -y -i ' + v + ' -c:v libx264 -preset veryfast -vf format=yuv420p -c:a copy -crf 17 -loglevel quiet ' + str(dest_path)
-                            proc.append(subprocess.Popen(command, env=env, shell=True, stdout=subprocess.PIPE))
+                            # Cross-platform ffmpeg discovery:
+                            # 1. Respect FFMPEG_DIR or FFMPEG_BIN env var (prepend to PATH)
+                            # 2. On Windows, fall back to C:\ffmpeg\bin if it exists
+                            ffmpeg_dir = env.get('FFMPEG_DIR') or env.get('FFMPEG_BIN')
+                            if not ffmpeg_dir and os.name == 'nt':
+                                candidate = r'C:\ffmpeg\bin'
+                                if os.path.isdir(candidate):
+                                    ffmpeg_dir = candidate
+                            if ffmpeg_dir and os.path.isdir(ffmpeg_dir):
+                                env["PATH"] = ffmpeg_dir + os.pathsep + env["PATH"]
+                            # Build command list (avoid shell quoting issues)
+                            command = [
+                                'ffmpeg', '-y', '-i', v,
+                                '-c:v', 'libx264', '-preset', 'veryfast',
+                                '-vf', 'format=yuv420p', '-c:a', 'copy',
+                                '-crf', '17', '-loglevel', 'quiet', str(dest_path)
+                            ]
+                            proc.append(subprocess.Popen(command, env=env, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
 
                     for p in proc:
                         p.wait()

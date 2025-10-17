@@ -42,12 +42,21 @@ from typing import Optional, List
 DB_NAME = 'experiment_local.sqlite'
 
 class ExperimentDB:
-    def __init__(self, root_dir: str):
+    def __init__(self, root_dir: str, mirror_dir: str | None = None):
         self.root_dir = root_dir
         self.db_path = os.path.join(root_dir, DB_NAME)
         os.makedirs(root_dir, exist_ok=True)
+        self.mirror_dir = mirror_dir
+        if self.mirror_dir:
+            try:
+                os.makedirs(self.mirror_dir, exist_ok=True)
+            except Exception:
+                # If mirror creation fails, disable mirroring silently
+                self.mirror_dir = None
         self._lock = threading.RLock()
         self._init_schema()
+        # Initial mirror copy post schema init
+        self._mirror_db()
 
     # ---------------- internal helpers ----------------
     def _connect(self):
@@ -84,6 +93,27 @@ class ExperimentDB:
                 CREATE INDEX IF NOT EXISTS idx_sessions_rfid_created ON sessions(rfid, created_utc DESC);
                 """
             )
+        # Mirror schema changes
+        self._mirror_db()
+
+    def _mirror_db(self):
+        """Copy primary DB file to mirror_dir atomically if configured."""
+        if not self.mirror_dir:
+            return
+        try:
+            src = self.db_path
+            dst = os.path.join(self.mirror_dir, DB_NAME)
+            # Use temporary file then replace to avoid partial copies
+            import shutil, tempfile
+            with tempfile.NamedTemporaryFile(dir=self.mirror_dir, delete=False) as tf:
+                tf.close()  # path only
+            shutil.copyfile(src, tf.name)
+            try:
+                os.replace(tf.name, dst)
+            except Exception:
+                shutil.copyfile(src, dst)
+        except Exception:
+            pass
 
     # ---------------- mice table ops ----------------
     def ensure_mouse(self, rfid: str, softmouse_payload: Optional[dict] = None):
@@ -95,6 +125,7 @@ class ExperimentDB:
                 cx.execute('UPDATE mice SET updated_utc=?, last_softmouse_pull=COALESCE(last_softmouse_pull, ?), softmouse_payload=COALESCE(?, softmouse_payload) WHERE rfid=?', (now, now, payload_txt, rfid))
             else:
                 cx.execute('INSERT INTO mice (rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc) VALUES (?,?,?,?,?)', (rfid, now, payload_txt, now, now))
+        self._mirror_db()
 
     def get_mouse_softmouse_payload(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -115,6 +146,7 @@ class ExperimentDB:
             cx.execute('INSERT INTO sessions (id,rfid,start_utc,prerecord,was_live_only,session_dir,metadata_yaml_path,created_utc,updated_utc) VALUES (?,?,?,?,?,?,?,?,?)', (
                 sid, rfid, now, json.dumps(prerecord) if prerecord else None, 1 if was_live_only else 0, session_dir, metadata_yaml_path, now, now
             ))
+        self._mirror_db()
         return sid
 
     def finalize_session(self, sid: str, postrecord: Optional[dict], session_notes: Optional[dict] = None):
@@ -123,6 +155,7 @@ class ExperimentDB:
             cx.execute('UPDATE sessions SET stop_utc=?, postrecord=?, session_notes=?, updated_utc=? WHERE id=?', (
                 now, json.dumps(postrecord) if postrecord else None, json.dumps(session_notes) if session_notes else None, now, sid
             ))
+        self._mirror_db()
 
     def last_session_for_mouse(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -167,6 +200,7 @@ class ExperimentDB:
         with self._lock, self._connect() as cx:
             qmarks = ','.join('?' for _ in ids)
             cx.execute(f'UPDATE sessions SET synced=1, updated_utc=? WHERE id IN ({qmarks})', [now, *ids])
+        self._mirror_db()
 
     # -------------- history queries --------------
     def list_sessions_for_mouse(self, rfid: str, limit: int = 50) -> List[dict]:

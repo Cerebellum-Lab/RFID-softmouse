@@ -565,6 +565,7 @@ class MainFrame(wx.Frame):
         self.menu_softmouse_cfg = config_menu.Append(wx.ID_ANY, 'SoftMouse Config\tCtrl+M')
         self.menu_rfid_cfg = config_menu.Append(wx.ID_ANY, 'RFID Config\tCtrl+R')
         self.menu_session_history = config_menu.Append(wx.ID_ANY, 'Session History\tCtrl+H')
+        self.menu_open_external_db = config_menu.Append(wx.ID_ANY, 'Open External DB...')
         menubar.Append(config_menu, '&Config')
         self.SetMenuBar(menubar)
         # Import dialogs now that menu is created (deferred import to keep top clean)
@@ -574,6 +575,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.onOpenSoftMouseConfig, self.menu_softmouse_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenRFIDConfig, self.menu_rfid_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenSessionHistory, self.menu_session_history)
+        self.Bind(wx.EVT_MENU, self.onOpenExternalDB, self.menu_open_external_db)
         # After user list (and config) populated, attempt automatic RFID start
         wx.CallAfter(self._start_rfid_listener)
 
@@ -619,6 +621,47 @@ class MainFrame(wx.Frame):
         finally:
             try:
                 dlg.Destroy()
+            except Exception:
+                pass
+
+    def onOpenExternalDB(self, event):
+        """Allow user to select an existing dummy or alternate ExperimentDB file and view sessions for an RFID."""
+        try:
+            with wx.FileDialog(self, message='Select experiment_local.sqlite file', wildcard='SQLite (*.sqlite)|*.sqlite|All files (*.*)|*.*', style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as fd:
+                if fd.ShowModal() != wx.ID_OK:
+                    return
+                db_path = fd.GetPath()
+            # Validate and load existing DB
+            from db.experiment_db import ExperimentDB
+            try:
+                ext_db = ExperimentDB.from_existing(db_path)
+            except Exception as e:
+                wx.MessageBox(f'Invalid DB: {e}', 'External DB', style=wx.OK|wx.ICON_ERROR)
+                return
+            # Ask for RFID to inspect
+            rfid_dlg = wx.TextEntryDialog(self, 'Enter 15-char RFID to view sessions:', 'External DB RFID')
+            if rfid_dlg.ShowModal() != wx.ID_OK:
+                return
+            rfid_val = ''.join(ch for ch in rfid_dlg.GetValue().strip() if ch.isalnum())
+            if len(rfid_val) != 15:
+                wx.MessageBox('RFID must be 15 alphanumeric characters.', 'External DB', style=wx.OK|wx.ICON_WARNING)
+                return
+            sessions = ext_db.list_sessions_for_mouse(rfid_val, limit=200)
+            if not sessions:
+                wx.MessageBox(f'No sessions found for RFID {rfid_val}.', 'External DB', style=wx.OK|wx.ICON_INFORMATION)
+                return
+            # Reuse SessionHistoryDialog if available
+            try:
+                dlg = SessionHistoryDialog(self, rfid_val, sessions)
+                dlg.ShowModal()
+            finally:
+                try:
+                    dlg.Destroy()
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.log.error('External DB open failed: %s', e)
             except Exception:
                 pass
 
@@ -1135,7 +1178,7 @@ class MainFrame(wx.Frame):
                 if os.name == 'nt':
                     # Windows network drive (legacy)
                     base_default = r'Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs'
-                else:
+                elif os.name == 'posix':
                     # Linux / Isilon mount path
                     base_default = '/mnt/isilon/Data/ReachingData/ExperimentLogs'
                 # Allow environment override (SOFTMOUSE_MIRROR_BASE)

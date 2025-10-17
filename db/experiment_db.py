@@ -58,6 +58,34 @@ class ExperimentDB:
         # Initial mirror copy post schema init
         self._mirror_db()
 
+    @classmethod
+    def from_existing(cls, db_path: str, mirror_dir: str | None = None):
+        """Load an existing ExperimentDB file at arbitrary path without creating / modifying schema.
+
+        Raises ValueError if required tables are missing.
+        """
+        inst = cls.__new__(cls)
+        inst.root_dir = os.path.dirname(db_path)
+        inst.db_path = db_path
+        inst.mirror_dir = mirror_dir
+        if inst.mirror_dir:
+            try:
+                os.makedirs(inst.mirror_dir, exist_ok=True)
+            except Exception:
+                inst.mirror_dir = None
+        inst._lock = threading.RLock()
+        # Validate schema presence
+        try:
+            with inst._lock, sqlite3.connect(inst.db_path) as cx:
+                cur = cx.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('mice','sessions')")
+                names = {r[0] for r in cur.fetchall()}
+            if not {'mice','sessions'}.issubset(names):
+                raise ValueError('Selected file missing required tables (mice, sessions)')
+        except Exception as e:
+            raise ValueError(f'Failed to validate existing DB: {e}')
+        # No initial mirroring by default; caller may trigger manually
+        return inst
+
     # ---------------- internal helpers ----------------
     def _connect(self):
         conn = sqlite3.connect(self.db_path)

@@ -572,6 +572,8 @@ class MainFrame(wx.Frame):
         self.menu_softmouse_cfg = config_menu.Append(wx.ID_ANY, 'SoftMouse Config\tCtrl+M')
         self.menu_rfid_cfg = config_menu.Append(wx.ID_ANY, 'RFID Config\tCtrl+R')
         self.menu_session_history = config_menu.Append(wx.ID_ANY, 'Session History\tCtrl+H')
+        # New: direct RFID port picker (lists available serial ports)
+        self.menu_rfid_port = config_menu.Append(wx.ID_ANY, 'Select RFID Port...')
         menubar.Append(config_menu, '&Config')
         self.SetMenuBar(menubar)
         # Import dialogs now that menu is created (deferred import to keep top clean)
@@ -581,6 +583,21 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.onOpenSoftMouseConfig, self.menu_softmouse_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenRFIDConfig, self.menu_rfid_cfg)
         self.Bind(wx.EVT_MENU, self.onOpenSessionHistory, self.menu_session_history)
+        self.Bind(wx.EVT_MENU, self.onSelectRFIDPort, self.menu_rfid_port)
+        # Attempt to load saved rfid_port from systemdata.yaml (add new key if missing)
+        try:
+            usrdatadir = os.path.dirname(os.path.realpath(__file__))
+            sysconfigname = os.path.join(usrdatadir, 'systemdata.yaml')
+            if os.path.isfile(sysconfigname):
+                from ruamel.yaml import YAML  # type: ignore
+                _yaml = YAML()
+                with open(sysconfigname, 'r', encoding='utf-8') as _fh:
+                    _sysdata = _yaml.load(_fh) or {}
+                saved_port = (_sysdata.get('rfid_port') or '').strip() if isinstance(_sysdata, dict) else ''
+                if saved_port:
+                    self._rfid_port_value = saved_port  # prefer explicit saved port
+        except Exception:
+            pass
         # After user list (and config) populated, attempt automatic RFID start
         wx.CallAfter(self._start_rfid_listener)
 
@@ -604,6 +621,54 @@ class MainFrame(wx.Frame):
                 dlg.Destroy()
             except Exception:
                 pass
+
+    def onSelectRFIDPort(self, event):
+        """Interactive selection of RFID serial port; saves to systemdata.yaml and starts listener."""
+        try:
+            from serial.tools import list_ports  # type: ignore
+        except Exception as e:
+            wx.MessageBox(f"pyserial not available: {e}", caption="RFID Port", style=wx.OK|wx.ICON_ERROR)
+            return
+        ports = list(list_ports.comports())
+        if not ports:
+            wx.MessageBox("No serial ports detected.", caption="RFID Port", style=wx.OK|wx.ICON_INFORMATION)
+            return
+        choices = [f"{p.device} - {p.description}" for p in ports]
+        dlg = wx.SingleChoiceDialog(self, "Select RFID Port", "RFID Port", choices)
+        if dlg.ShowModal() == wx.ID_OK:
+            sel_idx = dlg.GetSelection()
+            if 0 <= sel_idx < len(ports):
+                port_chosen = ports[sel_idx].device
+                self._rfid_port_value = port_chosen
+                # Persist to systemdata.yaml under key 'rfid_port'
+                try:
+                    usrdatadir = os.path.dirname(os.path.realpath(__file__))
+                    sysconfigname = os.path.join(usrdatadir, 'systemdata.yaml')
+                    from ruamel.yaml import YAML  # type: ignore
+                    _yaml = YAML()
+                    data = {}
+                    if os.path.isfile(sysconfigname):
+                        with open(sysconfigname, 'r', encoding='utf-8') as fh:
+                            existing = _yaml.load(fh) or {}
+                            if isinstance(existing, dict):
+                                data = existing
+                    data['rfid_port'] = port_chosen
+                    with open(sysconfigname, 'w', encoding='utf-8') as fh:
+                        _yaml.dump(data, fh)
+                    self.statusbar.SetStatusText(f"RFID port set to {port_chosen}")
+                except Exception as e:
+                    try:
+                        self.log.error('Failed saving rfid_port: %s', e)
+                    except Exception:
+                        pass
+                # Restart listener on new port
+                try:
+                    if getattr(self, 'rfid_listening', False):
+                        self._stop_rfid_listener()
+                    self._start_rfid_listener()
+                except Exception:
+                    pass
+        dlg.Destroy()
 
     def onOpenSessionHistory(self, event):
         try:
@@ -953,6 +1018,27 @@ class MainFrame(wx.Frame):
         if getattr(self, 'rfid_listening', False):
             return
         port = (getattr(self, '_rfid_port_value', '') or '').strip()
+        if not port:
+            # Fallback: read systemdata.yaml for saved rfid_port
+            try:
+                usrdatadir = os.path.dirname(os.path.realpath(__file__))
+                sysconfigname = os.path.join(usrdatadir, 'systemdata.yaml')
+                if os.path.isfile(sysconfigname):
+                    from ruamel.yaml import YAML  # type: ignore
+                    _yaml = YAML()
+                    with open(sysconfigname, 'r', encoding='utf-8') as fh:
+                        _sysdata = _yaml.load(fh) or {}
+                    if isinstance(_sysdata, dict):
+                        _sp = (_sysdata.get('rfid_port') or '').strip()
+                        if _sp:
+                            port = _sp
+                            self._rfid_port_value = port
+                            try:
+                                self.log.info('RFID port loaded from systemdata.yaml: %s', port)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         if not port:
             # Inform user; keep toggle off
             try:

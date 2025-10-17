@@ -30,6 +30,8 @@ raw_data_dir: C:\Users\reynoben\Documents
 interim_data_dir: C:\Users\reynoben\Documents
 compressed_data_dir: C:\Users\reynoben\Documents
 COM: 3
+# Saved RFID serial port (set via GUI Config > Select RFID Port...)
+rfid_port: ""
 
 # Stim ROI
 stimAxes: cam3

@@ -1097,9 +1097,47 @@ class MainFrame(wx.Frame):
             from db.experiment_db import ExperimentDB
             root = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
             root = os.path.abspath(root)
-            self.local_db = ExperimentDB(root)
+            # Determine mirror path: default pattern Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs\<unitRef>
+            mirror_path = None
+            try:
+                unit_ref = self.system_cfg.get('unitRef', 'UnitUnknown') if hasattr(self, 'system_cfg') else 'UnitUnknown'
+                default_mirror = os.path.join('Z:\PHYS\ChristieLab\Data\ReachingData\ExperimentLogs', unit_ref)
+                # If user config previously saved a custom mirror_dir, reuse it
+                saved_mirror = None
+                if hasattr(self, 'user_cfg') and isinstance(self.user_cfg, dict):
+                    saved_mirror = (self.user_cfg.get('database', {}) or {}).get('mirror_dir')
+                if saved_mirror and os.path.isdir(saved_mirror):
+                    mirror_path = saved_mirror
+                elif os.path.isdir(default_mirror):
+                    mirror_path = default_mirror
+                else:
+                    # Prompt user to select a directory for mirrored logs
+                    dlg = wx.DirDialog(self, message='Select directory to store mirrored experiment logs (second DB copy)',
+                                       style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST)
+                    if dlg.ShowModal() == wx.ID_OK:
+                        candidate = dlg.GetPath()
+                        if os.path.isdir(candidate):
+                            mirror_path = candidate
+                            # Persist choice in user config
+                            try:
+                                if not hasattr(self, 'user_cfg') or not isinstance(self.user_cfg, dict):
+                                    self.user_cfg = {}
+                                db_cfg = self.user_cfg.setdefault('database', {})
+                                db_cfg['mirror_dir'] = mirror_path
+                                self.write_user_config()
+                            except Exception:
+                                pass
+                    dlg.Destroy()
+            except Exception:
+                mirror_path = None
+            self.local_db = ExperimentDB(root, mirror_dir=mirror_path)
             self._db_init_done = True
             self.log.info('Local experiment DB initialized path=%s', getattr(self.local_db, 'db_path', '?'))
+            if mirror_path:
+                try:
+                    self.log.info('Mirror experiment DB path=%s', os.path.join(mirror_path, 'experiment_local.sqlite'))
+                except Exception:
+                    pass
         except Exception as e:
             try:
                 self.log.error('Failed initializing local DB: %s', e)

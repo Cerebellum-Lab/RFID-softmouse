@@ -214,6 +214,10 @@ class MainFrame(wx.Frame):
         camsizer.Add(self.rec, pos=(vpos,3), span=(1,3), flag=wx.ALL, border=wSpace)
         self.rec.Bind(wx.EVT_TOGGLEBUTTON, self.recordCam)
         self.rec.Enable(False)
+        # Test mode checkbox: skip dialogs & DB/file writes when engaged
+        self.test_mode = wx.CheckBox(self.widget_panel, id=wx.ID_ANY, label="Test")
+        camsizer.Add(self.test_mode, pos=(vpos,6), span=(1,2), flag=wx.LEFT, border=wSpace)
+        self.test_mode.SetValue(False)
         
         self.minRec = wx.SpinCtrl(self.widget_panel, value='20', size=(50, -1))
         self.minRec.Enable(False)
@@ -1060,6 +1064,9 @@ class MainFrame(wx.Frame):
         self._ensure_local_db()
         if not getattr(self, '_db_init_done', False):
             return
+        if hasattr(self, 'test_mode') and self.test_mode.GetValue():
+            # Skip DB session creation entirely in test mode
+            return
         try:
             self.local_db.ensure_mouse(rfid, softmouse_payload=getattr(self, 'mouse_meta', None))
             self._active_session_id = self.local_db.start_session(rfid, prerecord_ctx, was_live_only=was_live_only, session_dir=session_dir, metadata_yaml_path=yaml_path)
@@ -1900,6 +1907,7 @@ class MainFrame(wx.Frame):
         if self.rec.GetValue():
             # Reset abort flag at the start of a new recording attempt
             self._abort_recording = False
+            self._test_mode_active = hasattr(self, 'test_mode') and self.test_mode.GetValue()
             # Stop RFID listener for duration of recording
             try:
                 if getattr(self, 'rfid_listening', False):
@@ -1908,7 +1916,7 @@ class MainFrame(wx.Frame):
                 pass
             # --- Pre-record dialog (only if RFID present) ---
             try:
-                if getattr(self, 'mouse_meta', None) and not getattr(self, '_prerecord_context', None):
+                if (not self._test_mode_active) and getattr(self, 'mouse_meta', None) and not getattr(self, '_prerecord_context', None):
                     dlg = PreRecordDialog(self)
                     if dlg.ShowModal() == wx.ID_OK:
                         self._prerecord_context = dlg.get_values()
@@ -1978,9 +1986,13 @@ class MainFrame(wx.Frame):
             # Build session reference string for database snapshot exports
             session_ref = f"date_{self.system_cfg['unitRef']}_{sess_string}"  # e.g. date_UNIT123_session001
             self.session_ref = session_ref  # retain for finalize/export usage
-            self.sess_dir = os.path.join(base_dir, sess_string)
-            if not os.path.exists(self.sess_dir):
-                os.makedirs(self.sess_dir)
+            if self._test_mode_active:
+                import tempfile
+                self.sess_dir = tempfile.mkdtemp(prefix='testsession_')
+            else:
+                self.sess_dir = os.path.join(base_dir, sess_string)
+                if not os.path.exists(self.sess_dir):
+                    os.makedirs(self.sess_dir)
             self.meta,ruamelFile = clara.metadata_template()
             
             self.meta['duration (s)']=totTime
@@ -1991,16 +2003,19 @@ class MainFrame(wx.Frame):
             self.meta['Stim']=self.proto_str
             self.meta['StartTime']=datetime.datetime.now().strftime("%Y%m%d%H%M%S")
             self.meta['Collection']='info'
-            meta_name = '%s_%s_%s_metadata.yaml' % (date_string, self.system_cfg['unitRef'], sess_string)
-            self.metapath = os.path.join(self.sess_dir,meta_name)
-            usrdatadir = os.path.dirname(os.path.realpath(__file__))
-            self.currUsr= self.user_drop.GetStringSelection()
-            usrconfigname = os.path.join(usrdatadir,'Users', f'{self.currUsr}_userdata.yaml')
-            sysconfigname = os.path.join(usrdatadir, 'systemdata.yaml')
-            usrcopyname = '%s_%s_%s_%s_userdata_copy.yaml' % (date_string, self.system_cfg['unitRef'], sess_string, self.currUsr)
-            syscopyname = '%s_%s_%s_systemdata_copy.yaml' % (date_string, self.system_cfg['unitRef'], sess_string)
-            shutil.copyfile(usrconfigname,os.path.join(self.sess_dir,usrcopyname))
-            shutil.copyfile(sysconfigname,os.path.join(self.sess_dir,syscopyname))
+            if not self._test_mode_active:
+                meta_name = '%s_%s_%s_metadata.yaml' % (date_string, self.system_cfg['unitRef'], sess_string)
+                self.metapath = os.path.join(self.sess_dir,meta_name)
+                usrdatadir = os.path.dirname(os.path.realpath(__file__))
+                self.currUsr= self.user_drop.GetStringSelection()
+                usrconfigname = os.path.join(usrdatadir,'Users', f'{self.currUsr}_userdata.yaml')
+                sysconfigname = os.path.join(usrdatadir, 'systemdata.yaml')
+                usrcopyname = '%s_%s_%s_%s_userdata_copy.yaml' % (date_string, self.system_cfg['unitRef'], sess_string, self.currUsr)
+                syscopyname = '%s_%s_%s_systemdata_copy.yaml' % (date_string, self.system_cfg['unitRef'], sess_string)
+                shutil.copyfile(usrconfigname,os.path.join(self.sess_dir,usrcopyname))
+                shutil.copyfile(sysconfigname,os.path.join(self.sess_dir,syscopyname))
+            else:
+                self.metapath = None
             # Update DB session paths now that they are known
             try:
                 if not getattr(self, '_abort_recording', False) and self.save_to_db.GetValue() and getattr(self, '_active_session_id', None):
@@ -2011,15 +2026,22 @@ class MainFrame(wx.Frame):
             
             for ndx, s in enumerate(self.camStrList):
                 camID = str(self.system_cfg[s]['serial'])
-                name_base = '%s_%s_%s_%s' % (date_string, self.system_cfg['unitRef'], sess_string, self.system_cfg[s]['nickname'])
-                path_base = os.path.join(self.sess_dir,name_base)
+                if self._test_mode_active:
+                    name_base = 'TESTMODE'
+                    path_base = os.path.join(self.sess_dir, name_base)
+                else:
+                    name_base = '%s_%s_%s_%s' % (date_string, self.system_cfg['unitRef'], sess_string, self.system_cfg[s]['nickname'])
+                    path_base = os.path.join(self.sess_dir,name_base)
                 self.camq[camID].put(path_base)
                 self.camq_p2read[camID].get()
             
             if self.com.value >= 0:
                 self.ardq.put('recordPrep')
-                name_base = '%s_%s_%s' % (date_string, self.system_cfg['unitRef'], sess_string)
-                path_base = os.path.join(self.sess_dir,name_base)
+                if self._test_mode_active:
+                    path_base = os.path.join(self.sess_dir, 'TESTMODE')
+                else:
+                    name_base = '%s_%s_%s' % (date_string, self.system_cfg['unitRef'], sess_string)
+                    path_base = os.path.join(self.sess_dir,name_base)
                 self.ardq.put(path_base)
                 self.ardq_p2read.get()
                 
@@ -2047,7 +2069,7 @@ class MainFrame(wx.Frame):
                 self.log.info('Recording started session_dir=%s no RFID metadata session_ref=%s', self.sess_dir, getattr(self, 'session_ref', None))
             # Write metalink entry if RFID metadata present
             try:
-                if not getattr(self, '_abort_recording', False) and getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
+                if (not self._test_mode_active) and not getattr(self, '_abort_recording', False) and getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
                     self.write_metalink_entry()
             except Exception as e:
                 self.log.exception('Failed to write metalink entry: %s', e)
@@ -2070,10 +2092,13 @@ class MainFrame(wx.Frame):
                 except Exception as e:
                     print(f'Failed to attach mouse metadata: {e}')
             # Attach session_ref into metadata file
-            if getattr(self, 'session_ref', None):
-                self.meta['session_ref'] = self.session_ref
-            clara.write_metadata(self.meta, self.metapath)
-            self.log.info('Recording stopped session_dir=%s metadata_written=%s session_ref=%s', self.sess_dir, self.metapath, getattr(self, 'session_ref', None))
+            if not self._test_mode_active:
+                if getattr(self, 'session_ref', None):
+                    self.meta['session_ref'] = self.session_ref
+                clara.write_metadata(self.meta, self.metapath)
+                self.log.info('Recording stopped session_dir=%s metadata_written=%s session_ref=%s', self.sess_dir, self.metapath, getattr(self, 'session_ref', None))
+            else:
+                self.log.info('Test recording stopped (no metadata written) session_ref=%s', getattr(self, 'session_ref', None))
             # Restart RFID listener after recording (if not in live mode)
             try:
                 if not self.play.GetValue():
@@ -2082,20 +2107,23 @@ class MainFrame(wx.Frame):
                 pass
             # --- Post-record dialog ---
             post_context = None
-            try:
-                dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
-                if dlg2.ShowModal() == wx.ID_OK:
-                    post_context = dlg2.get_values()
-                dlg2.Destroy()
-            except Exception as _e:
+            if not self._test_mode_active:
                 try:
-                    self.log.error('PostRecord dialog failed: %s', _e)
-                except Exception:
-                    pass
+                    dlg2 = PostRecordDialog(self, getattr(self, '_prerecord_context', None))
+                    if dlg2.ShowModal() == wx.ID_OK:
+                        post_context = dlg2.get_values()
+                    dlg2.Destroy()
+                except Exception as _e:
+                    try:
+                        self.log.error('PostRecord dialog failed: %s', _e)
+                    except Exception:
+                        pass
             # Save combined metadata (JSON) in session dir
             try:
                 import json, datetime as _dt, pathlib as _pl
-                if hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
+                if self._test_mode_active:
+                    pass  # Skip writing session_notes.json entirely
+                elif hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
                     # Extended fields collection
                     try:
                         import platform as _pf, psutil as _ps
@@ -2163,11 +2191,12 @@ class MainFrame(wx.Frame):
                         'session_ref': getattr(self, 'session_ref', None),
                     }
                     jf = _pl.Path(self.sess_dir) / 'session_notes.json'
-                    with jf.open('w', encoding='utf-8') as fh:
-                        json.dump(merged, fh, indent=2)
+                    if not self._test_mode_active:
+                        with jf.open('w', encoding='utf-8') as fh:
+                            json.dump(merged, fh, indent=2)
                     # Finalize DB session now (if enabled)
                     try:
-                        if self.save_to_db.GetValue() and getattr(self, '_active_session_id', None) and not getattr(self, '_abort_recording', False):
+                        if (not self._test_mode_active) and self.save_to_db.GetValue() and getattr(self, '_active_session_id', None) and not getattr(self, '_abort_recording', False):
                             self._finalize_db_session(post_context, session_notes=merged)
                     except Exception:
                         pass
@@ -2178,7 +2207,7 @@ class MainFrame(wx.Frame):
                     pass
             # Prompt for new subject if RFID present
             try:
-                if getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
+                if (not self._test_mode_active) and getattr(self, 'mouse_meta', None) and self.mouse_meta.get('rfid'):
                     q = wx.MessageDialog(self, 'Will you switch to a new subject next?', 'New Subject?', style=wx.YES_NO|wx.ICON_QUESTION)
                     if q.ShowModal() == wx.ID_YES:
                         # Clear RFID state
@@ -2220,6 +2249,15 @@ class MainFrame(wx.Frame):
             self.protocol.Enable(True)
             for h in self.disable4cam:
                 h.Enable(True)
+            if self._test_mode_active:
+                # Remove temp test session directory
+                try:
+                    import shutil
+                    if hasattr(self, 'sess_dir') and os.path.isdir(self.sess_dir):
+                        shutil.rmtree(self.sess_dir)
+                except Exception:
+                    pass
+                self._test_mode_active = False
     
     def initThreads(self):
         if self.simulate_mode:

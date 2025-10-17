@@ -25,7 +25,6 @@ import compressVideos_v3 as compressVideos
 import shutil
 from pathlib import Path
 import ruamel.yaml
-import winsound
 import queue
 
 # --- Path bootstrap to allow running this script from nested acquisition/ folder ---
@@ -1776,7 +1775,6 @@ class MainFrame(wx.Frame):
                             for d in beepList: 
                                 duration = d  # seconds
                                 freq = 940  # Hz
-                                winsound.Beep(freq, duration)
                                 time.sleep(d)
                         else:
                             getNewPellet = True

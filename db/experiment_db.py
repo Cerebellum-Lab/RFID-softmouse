@@ -128,27 +128,59 @@ class ExperimentDB:
         Silent on failure to avoid interrupting acquisition.
         """
         try:
-            import sqlite3, csv
+            import sqlite3, csv, json as _json
+            # Acquire data once
             with self._lock, sqlite3.connect(self.db_path) as cx:
                 mice_rows = list(cx.execute('SELECT rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc FROM mice'))
-                session_rows = list(cx.execute('SELECT id,rfid,start_utc,stop_utc,prerecord,postrecord,session_notes,metadata_yaml_path,session_dir,was_live_only,synced,created_utc,updated_utc FROM sessions'))
-            mice_header = ['rfid','last_softmouse_pull','softmouse_payload','mouse_created_utc','mouse_updated_utc']
+                session_rows = list(cx.execute('SELECT id,rfid,start_utc,stop_utc,prerecord,postrecord,session_notes,metadata_yaml_path,session_dir,was_live_only,synced,created_utc,updated_utc FROM sessions ORDER BY rfid, start_utc ASC'))
+
+            # Discover all keys in softmouse_payload across mice (in first-seen order)
+            payload_keys: list[str] = []
+            payload_map: dict[str, dict] = {}
+            for m in mice_rows:
+                rfid = m[0]
+                raw = m[2]
+                parsed = None
+                if raw:
+                    try:
+                        parsed = _json.loads(raw)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, dict):
+                    for k in parsed.keys():
+                        if k not in payload_keys:
+                            payload_keys.append(k)
+                    payload_map[rfid] = parsed
+                else:
+                    payload_map[rfid] = {}
+
+            # Sanitize payload column names
+            payload_cols = [f"mouse_{k.replace(' ','_')}" for k in payload_keys]
+            date_ref_header = ['date_ref']
+            mice_header = ['rfid','last_softmouse_pull', *payload_cols, 'mouse_created_utc','mouse_updated_utc']
             sess_header = ['session_id','start_utc','stop_utc','prerecord','postrecord','session_notes','metadata_yaml_path','session_dir','was_live_only','synced','session_created_utc','session_updated_utc']
-            # Map mice by RFID for quick join
+
+            # Build per-session rows
             mouse_map = {m[0]: m for m in mice_rows}
-            # Build joined session rows
-            joined_rows = []
+            per_mouse_seq: dict[str,int] = {}
+            joined_rows: list[list] = []
             for s in session_rows:
-                # s order: id, rfid, start_utc, stop_utc, prerecord, postrecord, session_notes, metadata_yaml_path, session_dir, was_live_only, synced, created_utc, updated_utc
-                m = mouse_map.get(s[1])
+                rfid = s[1]
+                m = mouse_map.get(rfid)
                 if not m:
-                    continue  # skip if mouse not found (should not happen)
+                    continue
+                idx = per_mouse_seq.get(rfid, 0) + 1
+                per_mouse_seq[rfid] = idx
+                date_ref = f"date_{rfid}_session{idx:03d}"
+                payload_vals = [payload_map.get(rfid, {}).get(k) for k in payload_keys]
                 joined = [
-                    m[0], m[1], m[2], m[3], m[4],  # mouse cols
-                    s[0], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]  # session cols excluding duplicate RFID (s[1])
+                    date_ref,
+                    m[0], m[1], *payload_vals, m[3], m[4],
+                    s[0], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12]
                 ]
                 joined_rows.append(joined)
-            combined_header = mice_header + sess_header
+
+            combined_header = date_ref_header + mice_header + sess_header
             targets = [self.root_dir] + ([self.mirror_dir] if self.mirror_dir else [])
             for tgt in targets:
                 if not tgt:
@@ -162,15 +194,15 @@ class ExperimentDB:
                         w.writerows(joined_rows)
                 except Exception:
                     pass
-                # XLSX workbook per mouse
+                # XLSX export (per RFID sheet)
                 try:
                     import pandas as pd  # type: ignore
-                    # Group joined rows by RFID (first column)
                     per_mouse: dict[str, list[list]] = {}
                     for row in joined_rows:
-                        per_mouse.setdefault(row[0], []).append(row)
+                        rfid = row[1]  # after date_ref
+                        per_mouse.setdefault(rfid, []).append(row)
                     xlsx_path = os.path.join(tgt, 'mice_sessions.xlsx')
-                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:  # engine fallback automatic
+                    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
                         for rfid, rows in per_mouse.items():
                             sheet_name = rfid[:31]
                             df = pd.DataFrame(rows, columns=combined_header)

@@ -4,7 +4,18 @@
 # Or after chmod +x scan.sh placed on PATH, just: scan.sh --list
 
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve real path even when invoked via a symlink (so we can find scan.py)
+if command -v readlink >/dev/null 2>&1; then
+  REAL_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+else
+  # Portable fallback using Python realpath
+  REAL_PATH="$(python - <<'PY'
+import os,sys
+print(os.path.realpath(sys.argv[1]))
+PY
+"${BASH_SOURCE[0]}")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "${REAL_PATH}")" && pwd)"
 
 if ! command -v python >/dev/null 2>&1; then
   echo "Python not found in PATH. Activate your environment first." >&2

@@ -57,6 +57,8 @@ class ExperimentDB:
         self._init_schema()
         # Initial mirror copy post schema init
         self._mirror_db()
+        # Initial export snapshots
+        self._export_snapshots()
 
     # ---------------- internal helpers ----------------
     def _connect(self):
@@ -115,6 +117,55 @@ class ExperimentDB:
         except Exception:
             pass
 
+    def _export_snapshots(self):
+        """Write CSV and (if pandas available) XLSX snapshots of mice and sessions tables.
+
+        Creates mice.csv, sessions.csv, mice.xlsx, sessions.xlsx in root_dir and mirror_dir (if set).
+        Failures are silent (to avoid interrupting acquisition flow).
+        """
+        try:
+            import csv
+            import sqlite3
+            # Extract rows
+            with self._lock, sqlite3.connect(self.db_path) as cx:
+                mice_rows = list(cx.execute('SELECT rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc FROM mice'))
+                session_rows = list(cx.execute('SELECT id,rfid,start_utc,stop_utc,prerecord,postrecord,session_notes,metadata_yaml_path,session_dir,was_live_only,synced,created_utc,updated_utc FROM sessions'))
+            mice_header = ['rfid','last_softmouse_pull','softmouse_payload','created_utc','updated_utc']
+            session_header = ['id','rfid','start_utc','stop_utc','prerecord','postrecord','session_notes','metadata_yaml_path','session_dir','was_live_only','synced','created_utc','updated_utc']
+            targets = [self.root_dir] + ([self.mirror_dir] if self.mirror_dir else [])
+            for tgt in targets:
+                if not tgt:
+                    continue
+                try:
+                    # CSV files
+                    with open(os.path.join(tgt, 'mice.csv'), 'w', newline='', encoding='utf-8') as fh:
+                        w = csv.writer(fh)
+                        w.writerow(mice_header)
+                        w.writerows(mice_rows)
+                    with open(os.path.join(tgt, 'sessions.csv'), 'w', newline='', encoding='utf-8') as fh:
+                        w = csv.writer(fh)
+                        w.writerow(session_header)
+                        w.writerows(session_rows)
+                except Exception:
+                    pass
+            # XLSX (optional)
+            try:
+                import pandas as pd  # type: ignore
+                mice_df = pd.DataFrame(mice_rows, columns=mice_header)
+                sess_df = pd.DataFrame(session_rows, columns=session_header)
+                for tgt in targets:
+                    if not tgt:
+                        continue
+                    try:
+                        mice_df.to_excel(os.path.join(tgt, 'mice.xlsx'), index=False)
+                        sess_df.to_excel(os.path.join(tgt, 'sessions.xlsx'), index=False)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     # ---------------- mice table ops ----------------
     def ensure_mouse(self, rfid: str, softmouse_payload: Optional[dict] = None):
         now = dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z'
@@ -126,6 +177,7 @@ class ExperimentDB:
             else:
                 cx.execute('INSERT INTO mice (rfid,last_softmouse_pull,softmouse_payload,created_utc,updated_utc) VALUES (?,?,?,?,?)', (rfid, now, payload_txt, now, now))
         self._mirror_db()
+        self._export_snapshots()
 
     def get_mouse_softmouse_payload(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -147,6 +199,7 @@ class ExperimentDB:
                 sid, rfid, now, json.dumps(prerecord) if prerecord else None, 1 if was_live_only else 0, session_dir, metadata_yaml_path, now, now
             ))
         self._mirror_db()
+        self._export_snapshots()
         return sid
 
     def finalize_session(self, sid: str, postrecord: Optional[dict], session_notes: Optional[dict] = None):
@@ -156,6 +209,7 @@ class ExperimentDB:
                 now, json.dumps(postrecord) if postrecord else None, json.dumps(session_notes) if session_notes else None, now, sid
             ))
         self._mirror_db()
+        self._export_snapshots()
 
     def last_session_for_mouse(self, rfid: str) -> Optional[dict]:
         with self._lock, self._connect() as cx:
@@ -201,6 +255,7 @@ class ExperimentDB:
             qmarks = ','.join('?' for _ in ids)
             cx.execute(f'UPDATE sessions SET synced=1, updated_utc=? WHERE id IN ({qmarks})', [now, *ids])
         self._mirror_db()
+        self._export_snapshots()
 
     # -------------- history queries --------------
     def list_sessions_for_mouse(self, rfid: str, limit: int = 50) -> List[dict]:
